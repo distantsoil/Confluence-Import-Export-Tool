@@ -1,0 +1,1 @@
+"""Configuration management for Confluence Tool."""
