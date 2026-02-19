@@ -36,13 +36,16 @@ class ConfluenceImporter:
             'pages_updated': 0,
             'pages_skipped': 0,
             'folders_imported': 0,
+            'databases_imported': 0,
             'attachments_imported': 0,
             'errors': [],
             'start_time': None,
             'end_time': None
         }
-        self.page_mapping = {}  # Maps old page IDs to new page IDs
-        self.folder_mapping = {}  # Maps old folder IDs to new folder IDs
+        self.page_mapping = {}      # Maps old page IDs to new page IDs
+        self.folder_mapping = {}    # Maps old folder IDs to new folder IDs
+        self.database_mapping = {}  # Maps old database IDs to new database IDs
+        self.target_space_id = None  # Numeric space ID for the target space (v2 API)
         self.content_rewriter = None  # Will be set if space key remapping is enabled
         self.remapping_stats = {
             'links_rewritten': 0,
@@ -88,11 +91,20 @@ class ConfluenceImporter:
             
             # Verify target space exists
             self._verify_target_space(target_space_key)
-            
+
+            # Cache the numeric space ID for v2 API operations (folders, databases)
+            self.target_space_id = self.client.get_space_id(target_space_key)
+
             # Import folders first (if available)
             folders_dir = os.path.join(export_dir, 'folders')
             if os.path.exists(folders_dir):
                 self._import_folders(folders_dir, target_space_key)
+
+            # Import database stubs (if available — Cloud only)
+            # Must happen before pages so database IDs are mapped before child pages import
+            databases_dir = os.path.join(export_dir, 'databases')
+            if os.path.exists(databases_dir):
+                self._import_databases(databases_dir, target_space_key)
             
             # Import pages
             pages_dir = os.path.join(export_dir, 'pages')
@@ -115,6 +127,7 @@ class ConfluenceImporter:
                        f"Updated: {self.import_stats['pages_updated']} pages, "
                        f"Skipped: {self.import_stats['pages_skipped']} pages, "
                        f"Folders: {self.import_stats['folders_imported']}, "
+                       f"Database stubs: {self.import_stats['databases_imported']}, "
                        f"Attachments: {self.import_stats['attachments_imported']}")
             
             if self.import_stats['errors']:
@@ -352,6 +365,132 @@ class ConfluenceImporter:
             logger.error(f"Error importing folder {folder_title}: {e}")
             raise
     
+    def _import_databases(self, databases_dir: str, space_key: str) -> None:
+        """Import database stubs from the export directory.
+
+        Recreates the database container hierarchy so that pages which were
+        parented under databases can be moved into them during page import.
+        Database *content* (rows, columns, data) cannot be restored via API
+        and must be re-entered manually in the Confluence UI.
+
+        Args:
+            databases_dir: Path to the databases export directory
+            space_key: Target space key
+        """
+        try:
+            metadata_file = os.path.join(databases_dir, 'databases_metadata.json')
+            if not os.path.exists(metadata_file):
+                logger.info("No databases metadata found, skipping database import")
+                return
+
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                databases = json.load(f)
+
+            if not databases:
+                logger.info("No databases to import")
+                return
+
+            logger.info(
+                f"Found {len(databases)} database stubs to import. "
+                f"Note: database data (rows/columns) cannot be restored via API."
+            )
+
+            space_id = self.target_space_id or self.client.get_space_id(space_key)
+            if not space_id:
+                logger.warning(f"Could not get space ID for {space_key}, skipping database import")
+                return
+
+            # Import root databases first (no parentId), then children
+            root_databases = [d for d in databases if not d.get('parentId')]
+            child_databases = [d for d in databases if d.get('parentId')]
+
+            for database in root_databases:
+                try:
+                    self._import_single_database(database, space_id, None)
+                except Exception as e:
+                    error_msg = f"Failed to import database stub '{database.get('title', 'Unknown')}': {e}"
+                    logger.warning(error_msg)
+                    self.import_stats['errors'].append(error_msg)
+
+            # Multi-pass for nested databases (databases inside folders or under other databases)
+            max_passes = 10
+            remaining = child_databases.copy()
+
+            for pass_num in range(max_passes):
+                if not remaining:
+                    break
+
+                imported_in_pass = []
+
+                for database in remaining:
+                    old_parent_id = database.get('parentId')
+
+                    # Resolve parent from any of our mappings
+                    new_parent_id = (
+                        self.database_mapping.get(old_parent_id)
+                        or self.folder_mapping.get(old_parent_id)
+                        or self.page_mapping.get(old_parent_id)
+                    )
+
+                    if new_parent_id:
+                        try:
+                            self._import_single_database(database, space_id, new_parent_id)
+                            imported_in_pass.append(database)
+                        except Exception as e:
+                            error_msg = f"Failed to import database stub '{database.get('title', 'Unknown')}': {e}"
+                            logger.warning(error_msg)
+                            self.import_stats['errors'].append(error_msg)
+                            imported_in_pass.append(database)
+
+                for database in imported_in_pass:
+                    remaining.remove(database)
+
+                if not imported_in_pass:
+                    for database in remaining:
+                        error_msg = (
+                            f"Skipped database stub '{database.get('title', 'Unknown')}' "
+                            f"due to missing parent (ID: {database.get('parentId')})"
+                        )
+                        logger.warning(error_msg)
+                        self.import_stats['errors'].append(error_msg)
+                    break
+
+            logger.info(f"Imported {self.import_stats['databases_imported']} database stubs")
+
+        except Exception as e:
+            error_msg = f"Failed to import databases: {e}"
+            logger.warning(error_msg)
+            logger.debug(f"Database import error details: {e}", exc_info=True)
+
+    def _import_single_database(self, database: Dict[str, Any], space_id: str,
+                                 parent_id: Optional[str]) -> None:
+        """Import a single database stub.
+
+        Args:
+            database: Database metadata dictionary from export
+            space_id: Target space ID (numeric, for v2 API)
+            parent_id: New parent content ID (if any)
+        """
+        old_database_id = database.get('id')
+        database_title = database.get('title', 'Untitled Database')
+
+        try:
+            new_database = self.client.create_database(space_id, database_title, parent_id)
+            new_database_id = new_database.get('id')
+
+            if old_database_id and new_database_id:
+                self.database_mapping[old_database_id] = new_database_id
+
+            self.import_stats['databases_imported'] += 1
+            logger.info(
+                f"Created database stub: '{database_title}' "
+                f"(old ID: {old_database_id}, new ID: {new_database_id})"
+            )
+
+        except Exception as e:
+            logger.error(f"Error importing database stub '{database_title}': {e}")
+            raise
+
     def _import_pages(self, pages_dir: str, space_key: str, content_type: str = 'page') -> None:
             """Import pages from directory.
             
@@ -775,20 +914,49 @@ This placeholder was created to preserve the organizational structure of the fol
             # Determine parent page
             parent_id = self._find_parent_page(metadata, space_key)
     
-            # Create new page
+            # Create new page.
+            # When the intended parent is a folder or database, the v1 API
+            # silently ignores the ancestor and creates the page at root level.
+            # We correct this immediately after creation with a move call.
             new_page = self.client.create_page(space_key, title, content, parent_id)
             logger.info(f"Created new {content_type}: {title}")
             self.import_stats['pages_imported'] += 1
-            
+
             # Map old page ID to new page ID for child page imports
             if old_page_id and old_page_id != '':
                 self.page_mapping[old_page_id] = new_page['id']
                 logger.debug(f"Mapped page ID: {old_page_id} -> {new_page['id']}")
-    
+
+            # If the intended parent is a folder or database, the v1 create_page
+            # endpoint cannot place pages there directly.  Use the v1 move
+            # endpoint as the confirmed workaround (Cloud only).
+            if parent_id:
+                ancestors = metadata.get('ancestors', [])
+                old_parent_id = ancestors[-1].get('id') if ancestors else None
+                if old_parent_id:
+                    is_folder_parent = old_parent_id in self.folder_mapping
+                    is_database_parent = old_parent_id in self.database_mapping
+                    if is_folder_parent or is_database_parent:
+                        parent_type = 'folder' if is_folder_parent else 'database'
+                        moved = self.client.move_content(
+                            new_page['id'], parent_id, position='append'
+                        )
+                        if moved:
+                            logger.info(
+                                f"Moved '{title}' into {parent_type} "
+                                f"(ID: {parent_id})"
+                            )
+                        else:
+                            logger.warning(
+                                f"Could not move '{title}' into {parent_type} "
+                                f"(ID: {parent_id}); page remains at its default "
+                                f"position. This is a Cloud-only feature."
+                            )
+
             # Import attachments if enabled
             if self.config.get('import_attachments', True):
                 self._import_page_attachments(new_page['id'], pages_dir, filename, title)
-    
+
             return new_page['id']
     
         except Exception as e:
@@ -1044,14 +1212,18 @@ This placeholder was created to preserve the organizational structure of the fol
         parent_info = ancestors[-1]
         old_parent_id = parent_info.get('id')
         
-        # Check if we've already mapped this parent (could be a page or folder)
+        # Check if we've already mapped this parent (could be a page, folder, or database)
         if old_parent_id in self.page_mapping:
             return True
-        
+
         # Check if this is a folder reference
         if old_parent_id in self.folder_mapping:
             return True
-        
+
+        # Check if this is a database reference
+        if old_parent_id in self.database_mapping:
+            return True
+
         # Try to find parent by title
         parent_title = parent_info.get('title', '')
         if parent_title:
@@ -1059,7 +1231,7 @@ This placeholder was created to preserve the organizational structure of the fol
             if existing_parent:
                 self.page_mapping[old_parent_id] = existing_parent['id']
                 return True
-        
+
         # Parent not available yet
         return False
     
@@ -1084,14 +1256,18 @@ This placeholder was created to preserve the organizational structure of the fol
         parent_info = ancestors[-1]
         old_parent_id = parent_info.get('id')
         
-        # Check if we've already mapped this parent (could be a page or folder)
+        # Check if we've already mapped this parent (could be a page, folder, or database)
         if old_parent_id in self.page_mapping:
             return self.page_mapping[old_parent_id]
-        
+
         # Check if this is a folder reference
         if old_parent_id in self.folder_mapping:
             return self.folder_mapping[old_parent_id]
-        
+
+        # Check if this is a database reference
+        if old_parent_id in self.database_mapping:
+            return self.database_mapping[old_parent_id]
+
         # Try to find parent by title
         parent_title = parent_info.get('title', '')
         if parent_title:
@@ -1099,7 +1275,7 @@ This placeholder was created to preserve the organizational structure of the fol
             if existing_parent:
                 self.page_mapping[old_parent_id] = existing_parent['id']
                 return existing_parent['id']
-        
+
         # Parent not found, return None (page will be created as root page)
         logger.warning(f"Parent page not found for ancestors: {ancestors}")
         return None
@@ -1212,12 +1388,14 @@ This placeholder was created to preserve the organizational structure of the fol
                 'pages_updated': self.import_stats['pages_updated'],
                 'pages_skipped': self.import_stats['pages_skipped'],
                 'folders_imported': self.import_stats['folders_imported'],
+                'databases_imported': self.import_stats['databases_imported'],
                 'attachments_imported': self.import_stats['attachments_imported'],
                 'total_errors': len(self.import_stats['errors'])
             },
             'configuration': self.config,
             'page_mapping': self.page_mapping,
             'folder_mapping': self.folder_mapping,
+            'database_mapping': self.database_mapping,
             'errors': self.import_stats['errors']
         }
         
@@ -1272,6 +1450,7 @@ This placeholder was created to preserve the organizational structure of the fol
             <li class="warning"><strong>Pages Updated:</strong> {summary['statistics']['pages_updated']}</li>
             <li class="warning"><strong>Pages Skipped:</strong> {summary['statistics']['pages_skipped']}</li>
             <li class="success"><strong>Folders Imported:</strong> {summary['statistics']['folders_imported']}</li>
+            <li class="success"><strong>Database Stubs Imported:</strong> {summary['statistics'].get('databases_imported', 0)} (data not restored — re-enter manually in Confluence)</li>
             <li class="success"><strong>Attachments Imported:</strong> {summary['statistics']['attachments_imported']}</li>
             <li class="{'error' if summary['statistics']['total_errors'] > 0 else 'success'}">
                 <strong>Errors:</strong> {summary['statistics']['total_errors']}

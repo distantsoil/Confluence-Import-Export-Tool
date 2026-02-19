@@ -754,3 +754,199 @@ class ConfluenceAPIClient:
                 raise
             logger.error(f"Failed to create folder '{folder_name}': {e}")
             raise
+
+    def move_content(self, content_id: str, target_id: str,
+                     position: str = 'append') -> bool:
+        """Move content to be a child of (or sibling of) a target using the v1 move endpoint.
+
+        This is the confirmed workaround for placing pages under non-page content
+        types (folders, databases, whiteboards) where the create_page ancestors
+        parameter and the v2 API parentId field both fail with 500 errors.
+
+        Args:
+            content_id: ID of the content to move
+            target_id: ID of the target content (page, folder, database, etc.)
+            position: Relationship to target — 'append' (make child of target),
+                      'before' (sibling before target), 'after' (sibling after target)
+
+        Returns:
+            True if the move succeeded
+
+        Raises:
+            requests.exceptions.RequestException: On request failure
+
+        Notes:
+            Uses PUT /rest/api/content/{id}/move/{position}/{targetId}.
+            Despite the name, this endpoint works for moving content under any
+            target content type, not only pages.
+            Only available on Confluence Cloud (v2-era feature).
+        """
+        endpoint = f"content/{content_id}/move/{position}/{target_id}"
+        try:
+            self._rate_limit()
+            logger.debug(f"Moving content {content_id} to {position} {target_id}")
+            response = self._make_request('PUT', endpoint)
+            logger.info(f"Moved content {content_id} under target {target_id}")
+            return True
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                logger.warning(
+                    f"Move endpoint not available (likely Server/DC or content not found): {e}"
+                )
+            else:
+                logger.warning(
+                    f"Failed to move content {content_id} under {target_id} "
+                    f"(HTTP {status}): {e}"
+                )
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to move content {content_id} under {target_id}: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Database API (Confluence Cloud v2 only)
+    # ------------------------------------------------------------------
+
+    def get_databases(self, space_id: str) -> List[Dict[str, Any]]:
+        """Get databases in a space using the v2 API.
+
+        Args:
+            space_id: Space ID (not space key)
+
+        Returns:
+            List of database dictionaries, each containing at minimum
+            'id', 'title', and optionally 'parentId'.
+
+        Notes:
+            Databases are only available in Confluence Cloud via the v2 API.
+            The endpoint is GET /wiki/api/v2/databases?spaceId={space_id}.
+            Database *content* (rows, columns, data) is not accessible via API.
+        """
+        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+        v2_url = urljoin(self.base_url, v2_api_path)
+        endpoint_url = urljoin(v2_url, 'databases')
+
+        params = {
+            'spaceId': space_id,
+            'limit': 250
+        }
+
+        all_databases = []
+        cursor = None
+
+        try:
+            while True:
+                if cursor:
+                    params['cursor'] = cursor
+
+                self._rate_limit()
+                logger.debug(f"Getting databases from {endpoint_url} with params {params}")
+
+                response = self.session.get(
+                    endpoint_url,
+                    params=params,
+                    timeout=self.timeout
+                )
+                response.raise_for_status()
+
+                data = response.json()
+                results = data.get('results', [])
+                all_databases.extend(results)
+
+                links = data.get('_links', {})
+                next_link = links.get('next')
+
+                if not next_link:
+                    break
+
+                if isinstance(next_link, str) and '?' in next_link:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(next_link)
+                    query_params = parse_qs(parsed.query)
+                    cursor = query_params.get('cursor', [None])[0]
+                else:
+                    break
+
+                if not cursor:
+                    break
+
+                logger.debug(f"Retrieved {len(all_databases)} databases so far...")
+
+            logger.info(f"Retrieved {len(all_databases)} total databases from space {space_id}")
+            return all_databases
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (404, 405):
+                logger.info(
+                    f"Databases API not available (likely Server/DC or old Cloud instance): {e}"
+                )
+                return []
+            elif status == 500:
+                logger.info(
+                    f"Databases API returned server error (feature may not be enabled): {e}"
+                )
+                return []
+            raise
+        except Exception as e:
+            logger.warning(f"Error retrieving databases: {e}")
+            return []
+
+    def create_database(self, space_id: str, title: str,
+                        parent_id: str = None) -> Dict[str, Any]:
+        """Create an empty database stub in a space using the v2 API.
+
+        Creates the database container only.  Database content (rows, columns,
+        data) cannot be set via the REST API and must be re-entered manually
+        in the Confluence UI after import.
+
+        Args:
+            space_id: Space ID (not space key)
+            title: Database title
+            parent_id: Optional parent content ID (page or folder)
+
+        Returns:
+            Created database dictionary (contains at minimum 'id' and 'title')
+
+        Raises:
+            requests.exceptions.RequestException: On request failure
+
+        Notes:
+            Databases are only available in Confluence Cloud via the v2 API.
+            The endpoint is POST /wiki/api/v2/databases.
+        """
+        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+        v2_url = urljoin(self.base_url, v2_api_path)
+        endpoint_url = urljoin(v2_url, 'databases')
+
+        data: Dict[str, Any] = {
+            "spaceId": space_id,
+            "title": title
+        }
+        if parent_id:
+            data["parentId"] = parent_id
+
+        try:
+            self._rate_limit()
+            logger.debug(f"Creating database '{title}' in space {space_id}")
+
+            response = self.session.post(
+                endpoint_url,
+                json=data,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+
+            database = response.json()
+            logger.info(f"Created database stub: '{title}' (ID: {database.get('id')})")
+            return database
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                logger.warning(
+                    f"Databases API not available (likely Server/DC or old Cloud): {e}"
+                )
+            logger.error(f"Failed to create database '{title}': {e}")
+            raise
