@@ -186,10 +186,11 @@ class ConfluenceAPIClient:
         else:
             paths_to_try = [('/rest/api/', False), ('/wiki/rest/api/', True)]
 
-        # Use serverInfo as the probe endpoint — it is lightweight, requires no
-        # special permissions, and does not trigger Atlassian SSO redirects the
-        # way that some list endpoints (like /space) occasionally do.
-        probe_endpoint = 'serverInfo'
+        # Use user/current as the probe endpoint: lightweight, auth-aware (returns
+        # 401 for bad credentials rather than 404), present on all Confluence Cloud
+        # and Server/DC versions, and does not trigger SSO redirects.
+        # serverInfo was the original choice but is deprecated on newer Cloud tenants.
+        probe_endpoint = 'user/current'
 
         for api_path, is_cloud in paths_to_try:
             url = urljoin(f"{self.base_url}{api_path}", probe_endpoint)
