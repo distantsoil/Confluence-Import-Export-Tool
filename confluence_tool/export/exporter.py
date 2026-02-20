@@ -67,9 +67,14 @@ class ConfluenceExporter:
             # The v2 folders/databases endpoints require the v2-format space ID,
             # which differs from the legacy integer ID returned by the v1 API.
             # Fetch the v2 ID explicitly; fall back to v1 ID if unavailable.
+            space_id_v1 = space_info.get('id')
             space_id_v2 = self.client.get_space_id_v2(space_key)
-            folder_db_space_id = space_id_v2 or space_info.get('id')
+            folder_db_space_id = space_id_v2 or space_id_v1
             if folder_db_space_id:
+                logger.info(
+                    f"Using space ID {folder_db_space_id} for folders/databases "
+                    f"(v1={space_id_v1}, v2={space_id_v2})"
+                )
                 self._export_folders(folder_db_space_id, export_dir)
                 self._export_databases(folder_db_space_id, export_dir)
             

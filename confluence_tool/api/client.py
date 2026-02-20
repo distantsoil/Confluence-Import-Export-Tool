@@ -703,10 +703,11 @@ class ConfluenceAPIClient:
             results = response.json().get('results', [])
             if results:
                 v2_id = str(results[0].get('id', ''))
-                logger.debug(f"v2 space ID for '{space_key}': {v2_id}")
+                logger.info(f"v2 space ID for '{space_key}': {v2_id}")
                 return v2_id
+            logger.warning(f"v2 spaces API returned no results for key '{space_key}'")
         except Exception as e:
-            logger.debug(f"Could not get v2 space ID for {space_key}: {e}")
+            logger.warning(f"Could not get v2 space ID for {space_key}: {e}")
         return None
 
     def get_folders(self, space_id: str) -> List[Dict[str, Any]]:
