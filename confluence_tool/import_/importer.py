@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import html
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -11,6 +12,7 @@ import concurrent.futures
 from tqdm import tqdm
 import re
 from html.parser import HTMLParser
+import requests
 
 from ..api.client import ConfluenceAPIClient
 from ..utils.helpers import sanitize_filename
@@ -1404,17 +1406,31 @@ This placeholder was created to preserve the organizational structure of the fol
             if not attachment_files:
                 return
             
-            # Upload each attachment
+            # Upload each attachment (retry up to 3 times on server errors)
             for filename in attachment_files:
-                try:
-                    file_path = os.path.join(attach_dir, filename)
-                    self.client.upload_attachment(page_id, file_path, f"Imported attachment: {filename}")
-                    self.import_stats['attachments_imported'] += 1
-                    logger.debug(f"Uploaded attachment: {filename}")
-                except Exception as e:
-                    error_msg = f"Failed to upload attachment {filename}: {e}"
-                    logger.warning(error_msg)
-                    self.import_stats['errors'].append(error_msg)
+                file_path = os.path.join(attach_dir, filename)
+                for attempt in range(3):
+                    try:
+                        self.client.upload_attachment(page_id, file_path, f"Imported attachment: {filename}")
+                        self.import_stats['attachments_imported'] += 1
+                        logger.debug(f"Uploaded attachment: {filename}")
+                        break
+                    except requests.exceptions.HTTPError as e:
+                        status = e.response.status_code if e.response is not None else None
+                        if status and status >= 500 and attempt < 2:
+                            wait = 2 ** (attempt + 1)  # 2s, 4s
+                            logger.debug(f"Attachment upload attempt {attempt + 1} failed (HTTP {status}) for {filename}, retrying in {wait}s")
+                            time.sleep(wait)
+                        else:
+                            error_msg = f"Failed to upload attachment {filename}: {e}"
+                            logger.warning(error_msg)
+                            self.import_stats['errors'].append(error_msg)
+                            break
+                    except Exception as e:
+                        error_msg = f"Failed to upload attachment {filename}: {e}"
+                        logger.warning(error_msg)
+                        self.import_stats['errors'].append(error_msg)
+                        break
             
             logger.info(f"Imported {len(attachment_files)} attachments for page: {page_title}")
             
