@@ -138,7 +138,11 @@ class ConfluenceImporter:
             blogposts_dir = os.path.join(export_dir, 'blogposts')
             if os.path.exists(blogposts_dir):
                 self._import_pages(blogposts_dir, target_space_key, content_type='blogpost')
-            
+
+            # Import page-parented folders (deferred from folder phase —
+            # page_mapping is now fully populated)
+            self._import_deferred_folders(target_space_key)
+
             # Create import summary
             self._create_import_summary(export_dir, target_space_key, export_metadata)
             
@@ -302,40 +306,39 @@ class ConfluenceImporter:
                 logger.warning(f"Could not get space ID for {space_key}, skipping folder import")
                 return
             
-            # Sort folders by hierarchy (parents first)
-            # Root folders have parentType == "space" (or no parentType/parentId).
-            # Child folders have parentType == "folder".
-            # NOTE: Confluence v2 folder objects always have a parentId even for
-            # space-root folders (parentId is the space ID in that case), so we
-            # must use parentType rather than the mere presence of parentId to
-            # distinguish root from child folders.
-            root_folders = [f for f in folders if f.get('parentType') != 'folder']
-            child_folders = [f for f in folders if f.get('parentType') == 'folder']
-            
-            # Import root folders first
-            for folder in root_folders:
+            # Confluence folders have three parent types:
+            #   "space"  → sits at the space root (no page/folder parent)
+            #   "folder" → nested inside another folder
+            #   "page"   → nested inside a page
+            #
+            # Page-parented folders must be deferred until after pages are
+            # imported because page_mapping is empty at this point.
+            space_folders  = [f for f in folders if f.get('parentType') not in ('folder', 'page')]
+            folder_folders = [f for f in folders if f.get('parentType') == 'folder']
+            page_folders   = [f for f in folders if f.get('parentType') == 'page']
+
+            # Import space-root folders immediately (no parent ID needed)
+            for folder in space_folders:
                 try:
                     self._import_single_folder(folder, space_id, None)
                 except Exception as e:
                     error_msg = f"Failed to import folder '{folder.get('title', 'Unknown')}': {e}"
                     logger.warning(error_msg)
                     self.import_stats['errors'].append(error_msg)
-            
-            # Import child folders, potentially in multiple passes
-            # since some child folders may have parents that are also children
-            max_passes = 10  # Prevent infinite loops
-            remaining_folders = child_folders.copy()
-            
+
+            # Import folder-in-folder hierarchy via multi-pass
+            # (some children may depend on siblings not yet created)
+            max_passes = 10
+            remaining_folder_children = folder_folders.copy()
+
             for pass_num in range(max_passes):
-                if not remaining_folders:
+                if not remaining_folder_children:
                     break
-                
+
                 imported_in_pass = []
-                
-                for folder in remaining_folders:
+
+                for folder in remaining_folder_children:
                     old_parent_id = folder.get('parentId')
-                    
-                    # Check if parent has been mapped
                     if old_parent_id in self.folder_mapping:
                         new_parent_id = self.folder_mapping[old_parent_id]
                         try:
@@ -345,22 +348,24 @@ class ConfluenceImporter:
                             error_msg = f"Failed to import folder '{folder.get('title', 'Unknown')}': {e}"
                             logger.warning(error_msg)
                             self.import_stats['errors'].append(error_msg)
-                            imported_in_pass.append(folder)  # Remove from list even if failed
-                
-                # Remove successfully processed folders
+                            imported_in_pass.append(folder)
+
                 for folder in imported_in_pass:
-                    remaining_folders.remove(folder)
-                
-                # If no folders were imported in this pass, we can't make progress
+                    remaining_folder_children.remove(folder)
+
                 if not imported_in_pass:
-                    logger.warning(f"Could not import {len(remaining_folders)} folders due to missing parent references")
-                    for folder in remaining_folders:
-                        error_msg = f"Skipped folder '{folder.get('title', 'Unknown')}' due to missing parent"
-                        logger.warning(error_msg)
-                        self.import_stats['errors'].append(error_msg)
-                    break
-            
-            logger.info(f"Imported {self.import_stats['folders_imported']} folders")
+                    break  # No progress — remaining depend on page-parented ancestors
+
+            # Defer anything unresolved: page-parented folders, and any folder-in-folder
+            # chains whose ancestor is a page-parented folder (resolved in phase 2).
+            self._deferred_folders = remaining_folder_children + page_folders
+            if self._deferred_folders:
+                logger.info(
+                    f"Deferring {len(self._deferred_folders)} folder(s) with page parents "
+                    f"until after page import"
+                )
+
+            logger.info(f"Imported {self.import_stats['folders_imported']} folders in phase 1")
             
         except Exception as e:
             error_msg = f"Failed to import folders: {e}"
@@ -395,7 +400,89 @@ class ConfluenceImporter:
         except Exception as e:
             logger.error(f"Error importing folder {folder_title}: {e}")
             raise
-    
+
+    def _import_deferred_folders(self, space_key: str) -> None:
+        """Import folders whose parent is a page (phase 2, called after _import_pages).
+
+        Folders with parentType == "page" cannot be created during the initial
+        folder import because page_mapping is empty at that point.  This method
+        runs after all pages have been imported so that page_mapping is fully
+        populated.
+
+        Also handles folder-in-folder chains whose ancestor is a page-parented
+        folder — these were stuck in phase 1 and are resolved here via the same
+        multi-pass approach.
+        """
+        deferred = getattr(self, '_deferred_folders', [])
+        if not deferred:
+            return
+
+        space_id = self.target_space_id
+        if not space_id:
+            logger.warning("No space ID cached; cannot import deferred folders")
+            return
+
+        logger.info(f"Importing {len(deferred)} deferred folder(s) (phase 2 — after pages)")
+
+        remaining = deferred.copy()
+        max_passes = 10
+
+        for pass_num in range(max_passes):
+            if not remaining:
+                break
+
+            imported_in_pass = []
+
+            for folder in remaining:
+                old_parent_id = folder.get('parentId')
+                parent_type   = folder.get('parentType')
+
+                new_parent_id = None
+                if parent_type == 'page':
+                    # Parent is a page — must be in page_mapping by now.
+                    # page_mapping keys are stored as strings.
+                    str_pid = str(old_parent_id) if old_parent_id is not None else None
+                    if str_pid and str_pid in self.page_mapping:
+                        new_parent_id = self.page_mapping[str_pid]
+                    elif old_parent_id in self.folder_mapping:
+                        new_parent_id = self.folder_mapping[old_parent_id]
+                    else:
+                        continue  # Parent page not yet in mapping
+                elif parent_type == 'folder':
+                    if old_parent_id in self.folder_mapping:
+                        new_parent_id = self.folder_mapping[old_parent_id]
+                    else:
+                        continue  # Parent folder not yet created in this phase
+                else:
+                    new_parent_id = None  # Unexpected type — fall back to space root
+
+                try:
+                    self._import_single_folder(folder, space_id, new_parent_id)
+                    imported_in_pass.append(folder)
+                except Exception as e:
+                    error_msg = f"Failed to import folder '{folder.get('title', 'Unknown')}': {e}"
+                    logger.warning(error_msg)
+                    self.import_stats['errors'].append(error_msg)
+                    imported_in_pass.append(folder)  # Don't retry a hard failure
+
+            for folder in imported_in_pass:
+                remaining.remove(folder)
+
+            if not imported_in_pass:
+                logger.warning(
+                    f"Could not import {len(remaining)} deferred folder(s) — missing parent references"
+                )
+                for folder in remaining:
+                    error_msg = f"Skipped folder '{folder.get('title', 'Unknown')}' due to missing parent"
+                    logger.warning(error_msg)
+                    self.import_stats['errors'].append(error_msg)
+                break
+
+        logger.info(
+            f"Deferred folder import complete. "
+            f"Total folders imported: {self.import_stats['folders_imported']}"
+        )
+
     def _import_databases(self, databases_dir: str, space_key: str) -> None:
         """Import database stubs from the export directory.
 
