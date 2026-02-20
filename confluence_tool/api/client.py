@@ -166,49 +166,68 @@ class ConfluenceAPIClient:
     def test_connection(self) -> bool:
         """Test the connection to Confluence.
 
-        Tries the configured API path first.  If it returns 404 and we are in
-        Server mode (is_cloud=False), automatically retries with the Cloud path
-        (/wiki/rest/api/).  This handles the common case where the base_url is a
-        proxy or custom domain that ultimately resolves to atlassian.net but was
-        not detected as Cloud by hostname inspection alone.
+        Makes a single fast request against each possible API path and stops as
+        soon as one succeeds.  Always tries both paths regardless of the
+        auto-detected is_cloud value, so the tool self-heals for:
+
+          - base_url already containing /wiki  (stripped in __init__)
+          - is_cloud mis-detected (proxy / custom domain redirect)
+          - Confluence Cloud redirecting /wiki/rest/api/ to /rest/api/
+
+        On success updates self.is_cloud and self.api_path in-place so all
+        subsequent requests in this session use the correct path.
 
         Returns:
             True if connection is successful, False otherwise
         """
-        try:
-            self._make_request('GET', 'space')
-            logger.info(
-                f"Successfully connected to Confluence "
-                f"({'Cloud' if self.is_cloud else 'Server/DC'} mode, "
-                f"API path: {self.api_path})"
-            )
-            return True
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            # If Server mode returned 404, the instance may actually be Cloud — retry.
-            if status == 404 and not self.is_cloud:
-                logger.warning(
-                    f"Server/DC API path returned 404. "
-                    f"Retrying with Confluence Cloud path (/wiki/rest/api/)..."
-                )
-                self.is_cloud = True
-                self.api_path = '/wiki/rest/api/'
-                try:
-                    self._make_request('GET', 'space')
-                    logger.info(
-                        "Successfully connected to Confluence in Cloud mode "
-                        "(auto-detected via fallback). "
-                        "Tip: update base_url in config.yaml to the atlassian.net URL directly."
+        # Always start with the configured path so fast-path succeeds when correct.
+        if self.is_cloud:
+            paths_to_try = [('/wiki/rest/api/', True), ('/rest/api/', False)]
+        else:
+            paths_to_try = [('/rest/api/', False), ('/wiki/rest/api/', True)]
+
+        for api_path, is_cloud in paths_to_try:
+            url = urljoin(f"{self.base_url}{api_path}", 'space')
+            try:
+                self._rate_limit()
+                logger.debug(f"Testing connection: GET {url}")
+                response = self.session.get(url, timeout=self.timeout)
+                response.raise_for_status()
+
+                if api_path != self.api_path:
+                    logger.warning(
+                        f"Auto-corrected API path to '{api_path}' "
+                        f"(was '{self.api_path}'). "
+                        f"Tip: set base_url in config.yaml to the plain "
+                        f"atlassian.net URL with no trailing /wiki path."
                     )
-                    return True
-                except Exception as inner_e:
-                    logger.error(f"Connection test failed (Cloud fallback also failed): {inner_e}")
-                    return False
-            logger.error(f"Connection test failed: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Connection test failed: {e}")
-            return False
+                self.is_cloud = is_cloud
+                self.api_path = api_path
+                logger.info(
+                    f"Successfully connected to Confluence "
+                    f"({'Cloud' if is_cloud else 'Server/DC'} mode, "
+                    f"api_path: {api_path})"
+                )
+                return True
+
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status == 404:
+                    logger.warning(f"Got 404 on {url} — trying alternative API path...")
+                    continue
+                # Auth / permission errors — wrong credentials, not a path issue
+                logger.error(f"Connection test failed: {e}")
+                return False
+
+            except Exception as e:
+                logger.error(f"Connection test failed: {e}")
+                return False
+
+        logger.error(
+            "Connection test failed: both /wiki/rest/api/ and /rest/api/ returned 404. "
+            "Check that base_url is correct and credentials are valid."
+        )
+        return False
     
     def get_spaces(self, limit: int = 50, start: int = 0) -> List[Dict[str, Any]]:
         """Get list of Confluence spaces.
