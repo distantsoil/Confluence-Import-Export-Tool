@@ -186,8 +186,13 @@ class ConfluenceAPIClient:
         else:
             paths_to_try = [('/rest/api/', False), ('/wiki/rest/api/', True)]
 
+        # Use serverInfo as the probe endpoint — it is lightweight, requires no
+        # special permissions, and does not trigger Atlassian SSO redirects the
+        # way that some list endpoints (like /space) occasionally do.
+        probe_endpoint = 'serverInfo'
+
         for api_path, is_cloud in paths_to_try:
-            url = urljoin(f"{self.base_url}{api_path}", 'space')
+            url = urljoin(f"{self.base_url}{api_path}", probe_endpoint)
             try:
                 self._rate_limit()
                 logger.debug(f"Testing connection: GET {url}")
@@ -224,8 +229,9 @@ class ConfluenceAPIClient:
                 return False
 
         logger.error(
-            "Connection test failed: both /wiki/rest/api/ and /rest/api/ returned 404. "
-            "Check that base_url is correct and credentials are valid."
+            f"Connection test failed: {probe_endpoint} returned 404 on both "
+            "/wiki/rest/api/ and /rest/api/. "
+            "Check that base_url is correct and that your Confluence instance is accessible."
         )
         return False
     
