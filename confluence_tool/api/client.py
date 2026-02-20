@@ -673,7 +673,7 @@ class ConfluenceAPIClient:
         endpoint_url = urljoin(v2_url, 'folders')
         
         params = {
-            'spaceId': space_id,  # v2 API uses camelCase for parameters
+            'space-id': space_id,  # v2 API uses kebab-case for query parameters
             'limit': 250  # Maximum allowed by API
         }
         
@@ -729,13 +729,25 @@ class ConfluenceAPIClient:
             return all_folders
             
         except requests.exceptions.HTTPError as e:
-            # Folders may not be available (Server/DC or old Cloud instances)
-            if e.response.status_code == 404:
-                logger.info(f"Folders API not available (likely Server/DC instance or old Cloud): {e}")
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                logger.info("Folders API not available (likely Server/DC or old Cloud instance)")
                 return []
-            # Handle 500 errors gracefully - may indicate folder API not fully supported
-            elif e.response.status_code == 500:
-                logger.info(f"Folders API returned server error (may not be enabled or supported): {e}")
+            elif status == 405:
+                logger.info("Folders API method not allowed (likely Server/DC instance)")
+                return []
+            elif status == 500:
+                # Confluence Cloud returns 500 (not 400) for unrecognised query parameters.
+                # Log the response body to aid diagnosis.
+                body = ''
+                try:
+                    body = e.response.text[:500]
+                except Exception:
+                    pass
+                logger.warning(
+                    f"Folders API returned 500 for space {space_id}. "
+                    f"Response: {body or '(no body)'}"
+                )
                 return []
             raise
         except Exception as e:
@@ -871,7 +883,7 @@ class ConfluenceAPIClient:
         endpoint_url = urljoin(v2_url, 'databases')
 
         params = {
-            'spaceId': space_id,
+            'space-id': space_id,  # v2 API uses kebab-case for query parameters
             'limit': 250
         }
 
@@ -923,12 +935,18 @@ class ConfluenceAPIClient:
             status = e.response.status_code if e.response is not None else None
             if status in (404, 405):
                 logger.info(
-                    f"Databases API not available (likely Server/DC or old Cloud instance): {e}"
+                    "Databases API not available (likely Server/DC or old Cloud instance)"
                 )
                 return []
             elif status == 500:
-                logger.info(
-                    f"Databases API returned server error (feature may not be enabled): {e}"
+                body = ''
+                try:
+                    body = e.response.text[:500]
+                except Exception:
+                    pass
+                logger.warning(
+                    f"Databases API returned 500 for space {space_id}. "
+                    f"Response: {body or '(no body)'}"
                 )
                 return []
             raise
