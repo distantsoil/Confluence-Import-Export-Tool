@@ -943,95 +943,69 @@ class ConfluenceAPIClient:
     # ------------------------------------------------------------------
 
     def get_databases(self, space_id: str) -> List[Dict[str, Any]]:
-        """Get databases in a space using the v2 API.
+        """Discover databases in a space via v2 page-parent relationships.
+
+        GET /wiki/api/v2/databases?space-id={id} returns 500 on Confluence
+        Cloud for the same reason as the folders endpoint.  Instead, reuse
+        the cached _v2_page_parents mapping (populated by get_folders()) to
+        find pages whose parentType is "database", then fetch each database
+        individually via GET /wiki/api/v2/databases/{id}.
+
+        If get_folders() has not been called first (no cache), falls back to
+        returning an empty list with an informational log message.
 
         Args:
             space_id: Space ID (not space key)
 
         Returns:
-            List of database dictionaries, each containing at minimum
-            'id', 'title', and optionally 'parentId'.
-
-        Notes:
-            Databases are only available in Confluence Cloud via the v2 API.
-            The endpoint is GET /wiki/api/v2/databases?spaceId={space_id}.
-            Database *content* (rows, columns, data) is not accessible via API.
+            List of database dicts (id, title, parentId, parentType, …)
         """
-        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
-        v2_url = urljoin(self.base_url, v2_api_path)
-        endpoint_url = urljoin(v2_url, 'databases')
+        v2_base = self.base_url + ('/wiki/api/v2/' if self.is_cloud else '/api/v2/')
 
-        params = {
-            'space-id': space_id,  # v2 API uses kebab-case for query parameters
-            'limit': 250
+        # Reuse the page-parent data collected during get_folders().
+        # Databases are first-class content objects; pages inside a database
+        # have parentType == "database".
+        v2_page_parents = getattr(self, '_v2_page_parents', {})
+        if not v2_page_parents:
+            logger.info(
+                "No cached v2 page-parent data available for database discovery "
+                "(call get_folders() first). Skipping database export."
+            )
+            return []
+
+        database_ids: set = {
+            str(info['parentId'])
+            for info in v2_page_parents.values()
+            if info.get('parentType') == 'database' and info.get('parentId')
         }
 
-        all_databases = []
-        cursor = None
-
-        try:
-            while True:
-                if cursor:
-                    params['cursor'] = cursor
-
-                self._rate_limit()
-                logger.debug(f"Getting databases from {endpoint_url} with params {params}")
-
-                response = self.session.get(
-                    endpoint_url,
-                    params=params,
-                    timeout=self.timeout
-                )
-                response.raise_for_status()
-
-                data = response.json()
-                results = data.get('results', [])
-                all_databases.extend(results)
-
-                links = data.get('_links', {})
-                next_link = links.get('next')
-
-                if not next_link:
-                    break
-
-                if isinstance(next_link, str) and '?' in next_link:
-                    from urllib.parse import urlparse, parse_qs
-                    parsed = urlparse(next_link)
-                    query_params = parse_qs(parsed.query)
-                    cursor = query_params.get('cursor', [None])[0]
-                else:
-                    break
-
-                if not cursor:
-                    break
-
-                logger.debug(f"Retrieved {len(all_databases)} databases so far...")
-
-            logger.info(f"Retrieved {len(all_databases)} total databases from space {space_id}")
-            return all_databases
-
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status in (404, 405):
-                logger.info(
-                    "Databases API not available (likely Server/DC or old Cloud instance)"
-                )
-                return []
-            elif status == 500:
-                body = ''
-                try:
-                    body = e.response.text[:500]
-                except Exception:
-                    pass
-                logger.warning(
-                    f"Databases API returned 500 for space {space_id}. "
-                    f"Response: {body or '(no body)'}"
-                )
-                return []
-            raise
-        except Exception as e:
-            logger.warning(f"Error retrieving databases: {e}")
+        if not database_ids:
+            logger.info("No pages with database parents found in space — no databases to export")
             return []
+
+        logger.info(
+            f"Found {len(database_ids)} unique database parent(s) across "
+            f"{len(v2_page_parents)} pages; fetching database details…"
+        )
+
+        all_databases: Dict[str, Any] = {}
+        for db_id in database_ids:
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    v2_base + f'databases/{db_id}', timeout=self.timeout
+                )
+                if response.status_code == 200:
+                    all_databases[db_id] = response.json()
+                else:
+                    logger.debug(
+                        f"Could not fetch database {db_id}: HTTP {response.status_code}"
+                    )
+            except Exception as e:
+                logger.debug(f"Error fetching database {db_id}: {e}")
+
+        logger.info(f"Discovered {len(all_databases)} database(s) in space {space_id}")
+        return list(all_databases.values())
 
     def create_database(self, space_id: str, title: str,
                         parent_id: str = None) -> Dict[str, Any]:
