@@ -824,8 +824,11 @@ class ConfluenceAPIClient:
             return []
 
         if not folder_ids:
-            logger.info("No pages with folder parents found in space — no folders to export")
-            return []
+            logger.info(
+                "No pages with folder parents found in space — "
+                "trying direct folder API fallback (BFS from space root)"
+            )
+            return self._get_folders_by_bfs(space_id, v2_base)
 
         logger.info(
             f"Found {len(folder_ids)} unique folder parent(s) across "
@@ -865,7 +868,74 @@ class ConfluenceAPIClient:
         logger.info(f"Discovered {len(all_folders)} folder(s) in space {space_id}")
         return list(all_folders.values())
     
-    def create_folder(self, space_id: str, folder_name: str, 
+    def _get_folders_by_bfs(self, space_id: str, v2_base: str) -> List[Dict[str, Any]]:
+        """BFS fallback for get_folders when the space has no pages.
+
+        Queries GET /wiki/api/v2/folders?parentId={id} starting from the
+        space root, then recursively from each discovered folder.  This finds
+        folders even when the space contains no pages (so the page-parent
+        discovery in get_folders would yield nothing).
+
+        Args:
+            space_id: v2 space ID
+            v2_base:  base URL for the v2 API (already constructed by caller)
+
+        Returns:
+            List of folder dicts, or [] if the endpoint is unavailable.
+        """
+        all_folders: Dict[str, Any] = {}
+        # Seed the queue with the space itself so we get root-level folders
+        queue: list = [space_id]
+
+        while queue:
+            parent_id = queue.pop(0)
+            cursor = None
+
+            while True:
+                params: Dict[str, Any] = {'parentId': parent_id, 'limit': 250}
+                if cursor:
+                    params['cursor'] = cursor
+
+                try:
+                    self._rate_limit()
+                    response = self.session.get(
+                        v2_base + 'folders', params=params, timeout=self.timeout
+                    )
+                    if response.status_code in (500, 404, 405):
+                        logger.info(
+                            f"Direct folder API returned {response.status_code} "
+                            f"for parentId={parent_id}; skipping"
+                        )
+                        break
+                    response.raise_for_status()
+                    data = response.json()
+                except Exception as e:
+                    logger.warning(f"Error in BFS folder fetch for parentId={parent_id}: {e}")
+                    break
+
+                for folder in data.get('results', []):
+                    fid = str(folder.get('id', ''))
+                    if fid and fid not in all_folders:
+                        all_folders[fid] = folder
+                        queue.append(fid)  # recurse into sub-folders
+
+                next_link = data.get('_links', {}).get('next')
+                if not next_link:
+                    break
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(next_link) if isinstance(next_link, str) else None
+                cursor = parse_qs(parsed.query).get('cursor', [None])[0] if parsed else None
+                if not cursor:
+                    break
+
+        if all_folders:
+            logger.info(f"BFS fallback discovered {len(all_folders)} folder(s) in space {space_id}")
+        else:
+            logger.info("BFS fallback found no folders (endpoint may be unsupported)")
+
+        return list(all_folders.values())
+
+    def create_folder(self, space_id: str, folder_name: str,
                      parent_id: str = None) -> Dict[str, Any]:
         """Create a folder in a space using v2 API.
         
