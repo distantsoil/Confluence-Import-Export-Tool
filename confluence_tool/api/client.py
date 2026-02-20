@@ -33,11 +33,21 @@ class ConfluenceAPIClient:
         self.max_retries = max_retries
         self.rate_limit = rate_limit
         self._last_request_time = 0
-        
+
         # Detect if this is a Confluence Cloud instance (atlassian.net domain)
         # Cloud instances require /wiki/rest/api/ path, while Server/Data Center use /rest/api/
         self.is_cloud = 'atlassian.net' in self.base_url.lower()
         self.api_path = '/wiki/rest/api/' if self.is_cloud else '/rest/api/'
+
+        # Normalise base_url: if the user included '/wiki' at the end of their URL,
+        # strip it — the tool appends '/wiki/rest/api/' automatically for Cloud instances,
+        # so leaving it in produces double-/wiki paths that cause 404s.
+        if self.base_url.lower().endswith('/wiki'):
+            self.base_url = self.base_url[:-5]
+            logger.warning(
+                "Removed trailing '/wiki' from base_url — it is added automatically. "
+                f"Using: {self.base_url}"
+            )
         
         # Set up authentication
         if auth_token:
@@ -155,14 +165,47 @@ class ConfluenceAPIClient:
     
     def test_connection(self) -> bool:
         """Test the connection to Confluence.
-        
+
+        Tries the configured API path first.  If it returns 404 and we are in
+        Server mode (is_cloud=False), automatically retries with the Cloud path
+        (/wiki/rest/api/).  This handles the common case where the base_url is a
+        proxy or custom domain that ultimately resolves to atlassian.net but was
+        not detected as Cloud by hostname inspection alone.
+
         Returns:
             True if connection is successful, False otherwise
         """
         try:
-            response = self._make_request('GET', 'space')
-            logger.info("Successfully connected to Confluence")
+            self._make_request('GET', 'space')
+            logger.info(
+                f"Successfully connected to Confluence "
+                f"({'Cloud' if self.is_cloud else 'Server/DC'} mode, "
+                f"API path: {self.api_path})"
+            )
             return True
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            # If Server mode returned 404, the instance may actually be Cloud — retry.
+            if status == 404 and not self.is_cloud:
+                logger.warning(
+                    f"Server/DC API path returned 404. "
+                    f"Retrying with Confluence Cloud path (/wiki/rest/api/)..."
+                )
+                self.is_cloud = True
+                self.api_path = '/wiki/rest/api/'
+                try:
+                    self._make_request('GET', 'space')
+                    logger.info(
+                        "Successfully connected to Confluence in Cloud mode "
+                        "(auto-detected via fallback). "
+                        "Tip: update base_url in config.yaml to the atlassian.net URL directly."
+                    )
+                    return True
+                except Exception as inner_e:
+                    logger.error(f"Connection test failed (Cloud fallback also failed): {inner_e}")
+                    return False
+            logger.error(f"Connection test failed: {e}")
+            return False
         except Exception as e:
             logger.error(f"Connection test failed: {e}")
             return False
