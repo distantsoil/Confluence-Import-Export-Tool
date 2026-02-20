@@ -871,67 +871,84 @@ class ConfluenceAPIClient:
     def _get_folders_by_bfs(self, space_id: str, v2_base: str) -> List[Dict[str, Any]]:
         """BFS fallback for get_folders when the space has no pages.
 
-        Queries GET /wiki/api/v2/folders?parentId={id} starting from the
-        space root, then recursively from each discovered folder.  This finds
-        folders even when the space contains no pages (so the page-parent
-        discovery in get_folders would yield nothing).
+        Tries three strategies in order, stopping at the first that yields results:
+
+          1. GET /wiki/api/v2/folders?space-id={id}   — returns all folders in one
+             shot (paginated). Returns 500 on some tenants; skipped if so.
+          2. GET /wiki/api/v2/folders?parentId={space_id} — root-level folders whose
+             parent is the space, then recursively GET …?parentId={folder_id}.
+          3. (no further fallback) — log diagnostic info and return [].
 
         Args:
             space_id: v2 space ID
             v2_base:  base URL for the v2 API (already constructed by caller)
 
         Returns:
-            List of folder dicts, or [] if the endpoint is unavailable.
+            List of folder dicts, or [] if all strategies are unavailable.
         """
-        all_folders: Dict[str, Any] = {}
-        # Seed the queue with the space itself so we get root-level folders
-        queue: list = [space_id]
+        from urllib.parse import urlparse, parse_qs
 
-        while queue:
-            parent_id = queue.pop(0)
+        def _paginate(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+            """Fetch all pages of results for the given params; return [] on error."""
+            results: List[Dict[str, Any]] = []
             cursor = None
-
             while True:
-                params: Dict[str, Any] = {'parentId': parent_id, 'limit': 250}
+                p = dict(params)
                 if cursor:
-                    params['cursor'] = cursor
-
+                    p['cursor'] = cursor
                 try:
                     self._rate_limit()
-                    response = self.session.get(
-                        v2_base + 'folders', params=params, timeout=self.timeout
+                    resp = self.session.get(
+                        v2_base + 'folders', params=p, timeout=self.timeout
                     )
-                    if response.status_code in (500, 404, 405):
-                        logger.info(
-                            f"Direct folder API returned {response.status_code} "
-                            f"for parentId={parent_id}; skipping"
-                        )
-                        break
-                    response.raise_for_status()
-                    data = response.json()
-                except Exception as e:
-                    logger.warning(f"Error in BFS folder fetch for parentId={parent_id}: {e}")
-                    break
+                    print(f"    [folder API] GET folders {p} → HTTP {resp.status_code}")
+                    if resp.status_code != 200:
+                        return []
+                    data = resp.json()
+                except Exception as exc:
+                    print(f"    [folder API] error for {p}: {exc}")
+                    return []
 
-                for folder in data.get('results', []):
-                    fid = str(folder.get('id', ''))
-                    if fid and fid not in all_folders:
-                        all_folders[fid] = folder
-                        queue.append(fid)  # recurse into sub-folders
-
+                batch = data.get('results', [])
+                print(f"    [folder API] {len(batch)} result(s) in this page")
+                results.extend(batch)
                 next_link = data.get('_links', {}).get('next')
                 if not next_link:
                     break
-                from urllib.parse import urlparse, parse_qs
                 parsed = urlparse(next_link) if isinstance(next_link, str) else None
                 cursor = parse_qs(parsed.query).get('cursor', [None])[0] if parsed else None
                 if not cursor:
                     break
+            return results
+
+        # ── Strategy 1: space-id filter (gets everything in one sweep) ────── #
+        print(f"  [folder discovery] strategy 1: space-id={space_id}")
+        by_space = _paginate({'space-id': space_id, 'limit': 250})
+        if by_space:
+            print(f"  [folder discovery] strategy 1 found {len(by_space)} folder(s)")
+            return by_space
+
+        # ── Strategy 2: BFS from space root via parentId ──────────────────── #
+        print(f"  [folder discovery] strategy 2: parentId BFS from space {space_id}")
+        all_folders: Dict[str, Any] = {}
+        queue: list = [space_id]
+
+        while queue:
+            parent_id = queue.pop(0)
+            page_results = _paginate({'parentId': parent_id, 'limit': 250})
+            for folder in page_results:
+                fid = str(folder.get('id', ''))
+                if fid and fid not in all_folders:
+                    all_folders[fid] = folder
+                    queue.append(fid)
 
         if all_folders:
-            logger.info(f"BFS fallback discovered {len(all_folders)} folder(s) in space {space_id}")
+            print(f"  [folder discovery] strategy 2 found {len(all_folders)} folder(s)")
         else:
-            logger.info("BFS fallback found no folders (endpoint may be unsupported)")
+            print(
+                f"  [folder discovery] both strategies returned 0 folders "
+                f"(space_id={space_id}, v2_base={v2_base})"
+            )
 
         return list(all_folders.values())
 
