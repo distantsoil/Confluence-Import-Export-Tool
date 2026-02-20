@@ -659,6 +659,38 @@ class ConfluenceAPIClient:
             return True
         except Exception as e:
             logger.error(f"Failed to delete page {page_id}: {e}")
+
+    def delete_folder(self, folder_id: str) -> bool:
+        """Delete a folder via the v2 API.
+
+        Args:
+            folder_id: Folder ID to delete
+
+        Returns:
+            True if deletion was successful (including already-deleted 404)
+
+        Raises:
+            requests.exceptions.RequestException: On request failure (except 404)
+        """
+        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+        v2_url = urljoin(self.base_url, v2_api_path)
+        endpoint_url = urljoin(v2_url, f'folders/{folder_id}')
+
+        try:
+            self._rate_limit()
+            response = self.session.delete(endpoint_url, timeout=self.timeout)
+            if response.status_code == 404:
+                logger.debug(f"Folder {folder_id} not found (already deleted)")
+                return True
+            response.raise_for_status()
+            logger.info(f"Deleted folder with ID: {folder_id}")
+            return True
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return True  # Already gone — treat as success
+            logger.error(f"Failed to delete folder {folder_id}: {e}")
+            raise
+
     def get_space_id(self, space_key: str) -> Optional[str]:
         """Get space ID from space key.
 

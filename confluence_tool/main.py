@@ -829,46 +829,64 @@ def clean_space(ctx, space_key, dry_run, target_config):
         except Exception as e:
             print_colored(f"Error fetching pages: {e}", 'RED')
             sys.exit(1)
-        
-        if not pages:
-            print_colored(f"No pages found in space '{space_key}'. Nothing to delete.", 'GREEN')
+
+        # Fetch all folders (Cloud only — silently skip if unavailable)
+        print_colored(f"Fetching folders from space '{space_key}'...", 'YELLOW')
+        folders = []
+        try:
+            space_id_v2 = client.get_space_id_v2(space_key)
+            if space_id_v2:
+                folders = client.get_folders(space_id_v2)
+        except Exception as e:
+            print_colored(f"Note: Could not fetch folders (may not be supported): {e}", 'YELLOW')
+
+        if not pages and not folders:
+            print_colored(f"No content found in space '{space_key}'. Nothing to delete.", 'GREEN')
             return
         
         # Display what will be deleted
         print()
         print_colored("=" * 70, 'YELLOW')
-        print_colored(f"PAGES TO BE DELETED FROM SPACE: {space_key} ({space_name})", 'YELLOW')
+        print_colored(f"CONTENT TO BE DELETED FROM SPACE: {space_key} ({space_name})", 'YELLOW')
         print_colored("=" * 70, 'YELLOW')
         print()
-        print_colored(f"Total pages found: {len(pages)}", 'CYAN')
+        print_colored(f"Total pages found:   {len(pages)}", 'CYAN')
+        print_colored(f"Total folders found: {len(folders)}", 'CYAN')
         print()
-        
+
         # Show a preview of pages (first 10 and last 5 if more than 15)
-        if len(pages) <= 15:
-            for page in pages:
-                page_title = page.get('title', 'Unknown')
-                page_id = page.get('id', 'Unknown')
-                print(f"  - {page_title} (ID: {page_id})")
-        else:
-            for i, page in enumerate(pages[:10]):
-                page_title = page.get('title', 'Unknown')
-                page_id = page.get('id', 'Unknown')
-                print(f"  - {page_title} (ID: {page_id})")
-            print(f"  ... and {len(pages) - 15} more pages ...")
-            for page in pages[-5:]:
-                page_title = page.get('title', 'Unknown')
-                page_id = page.get('id', 'Unknown')
-                print(f"  - {page_title} (ID: {page_id})")
+        if pages:
+            print_colored("Pages:", 'WHITE')
+            if len(pages) <= 15:
+                for page in pages:
+                    print(f"  - {page.get('title', 'Unknown')} (ID: {page.get('id', 'Unknown')})")
+            else:
+                for page in pages[:10]:
+                    print(f"  - {page.get('title', 'Unknown')} (ID: {page.get('id', 'Unknown')})")
+                print(f"  ... and {len(pages) - 15} more pages ...")
+                for page in pages[-5:]:
+                    print(f"  - {page.get('title', 'Unknown')} (ID: {page.get('id', 'Unknown')})")
+
+        # Show a preview of folders
+        if folders:
+            print_colored("Folders:", 'WHITE')
+            for folder in folders[:10]:
+                print(f"  - {folder.get('title', 'Unknown')} (ID: {folder.get('id', 'Unknown')})")
+            if len(folders) > 10:
+                print(f"  ... and {len(folders) - 10} more folders ...")
         
         print()
         
         if dry_run:
             print_colored("=" * 70, 'CYAN')
-            print_colored("DRY RUN MODE - No pages will be deleted", 'CYAN')
+            print_colored("DRY RUN MODE - No content will be deleted", 'CYAN')
             print_colored("=" * 70, 'CYAN')
             print()
-            print_colored(f"This was a preview. {len(pages)} pages would be deleted.", 'GREEN')
-            print_colored("Run without --dry-run to actually delete the pages.", 'YELLOW')
+            print_colored(
+                f"This was a preview. {len(pages)} pages and {len(folders)} folders would be deleted.",
+                'GREEN'
+            )
+            print_colored("Run without --dry-run to actually delete the content.", 'YELLOW')
             return
         
         # Show strong warnings
@@ -877,7 +895,7 @@ def clean_space(ctx, space_key, dry_run, target_config):
         print_colored("⚠️  WARNING: THIS IS A DESTRUCTIVE OPERATION!                        ⚠️", 'RED')
         print_colored("⚠️  " + "=" * 66 + " ⚠️", 'RED')
         print()
-        print_colored(f"You are about to DELETE ALL {len(pages)} pages from:", 'RED')
+        print_colored(f"You are about to DELETE ALL {len(pages)} pages and {len(folders)} folders from:", 'RED')
         print_colored(f"  Space: {space_key} ({space_name})", 'RED')
         print_colored(f"  URL: {confluence_config['base_url']}", 'RED')
         print()
@@ -896,7 +914,11 @@ def clean_space(ctx, space_key, dry_run, target_config):
         print_colored("FINAL CONFIRMATION REQUIRED", 'YELLOW')
         print_colored("=" * 70, 'YELLOW')
         print()
-        print_colored(f"To confirm deletion of {len(pages)} pages from space '{space_key}',", 'YELLOW')
+        print_colored(
+            f"To confirm deletion of {len(pages)} pages and {len(folders)} folders "
+            f"from space '{space_key}',",
+            'YELLOW'
+        )
         print_colored("please type exactly: I CONFIRM", 'YELLOW')
         print()
         
@@ -908,7 +930,9 @@ def clean_space(ctx, space_key, dry_run, target_config):
         
         # Proceed with deletion
         print()
-        print_colored(f"Starting deletion of {len(pages)} pages...", 'CYAN')
+        print_colored(
+            f"Starting deletion of {len(pages)} pages and {len(folders)} folders...", 'CYAN'
+        )
         print()
         
         # Use tqdm for progress bar
@@ -934,27 +958,73 @@ def clean_space(ctx, space_key, dry_run, target_config):
                 })
                 logger.error(f"Failed to delete page '{page_title}' (ID: {page_id}): {e}")
         
+        # Delete folders (multi-pass: 404 = already gone; retry handles nesting order)
+        folder_deleted_count = 0
+        folder_failed = []
+
+        if folders:
+            print()
+            print_colored(f"Deleting {len(folders)} folders...", 'CYAN')
+            print()
+            folder_ids = [str(f.get('id')) for f in folders]
+            for fid in tqdm(folder_ids, desc="Deleting folders", unit="folder"):
+                try:
+                    client.delete_folder(fid)
+                    folder_deleted_count += 1
+                except Exception as e:
+                    folder_failed.append({'id': fid, 'error': str(e)})
+
+            # Retry failed folders — sub-folders may need their parent deleted
+            # first (or vice-versa), so a few passes handle arbitrary nesting.
+            for _attempt in range(4):
+                if not folder_failed:
+                    break
+                still_failed = []
+                for item in folder_failed:
+                    try:
+                        client.delete_folder(item['id'])
+                        folder_deleted_count += 1
+                    except Exception as e:
+                        item['error'] = str(e)
+                        still_failed.append(item)
+                folder_failed = still_failed
+
         # Show summary
         print()
         print_colored("=" * 70, 'CYAN')
         print_colored("DELETION SUMMARY", 'CYAN')
         print_colored("=" * 70, 'CYAN')
         print()
-        print_colored(f"Total pages processed: {len(pages)}", 'CYAN')
-        print_colored(f"Successfully deleted: {deleted_count}", 'GREEN')
-        
+        print_colored(f"Pages processed:          {len(pages)}", 'CYAN')
+        print_colored(f"  Successfully deleted:    {deleted_count}", 'GREEN')
         if failed_count > 0:
-            print_colored(f"Failed to delete: {failed_count}", 'RED')
+            print_colored(f"  Failed:                 {failed_count}", 'RED')
+        print_colored(f"Folders processed:        {len(folders)}", 'CYAN')
+        print_colored(f"  Successfully deleted:    {folder_deleted_count}", 'GREEN')
+        if folder_failed:
+            print_colored(f"  Failed:                 {len(folder_failed)}", 'RED')
+
+        if failed_count > 0:
             print()
             print_colored("Failed pages:", 'RED')
-            for failed_page in failed_pages[:10]:  # Show first 10 failures
+            for failed_page in failed_pages[:10]:
                 print(f"  - {failed_page['title']} (ID: {failed_page['id']})")
                 print(f"    Error: {failed_page['error']}")
             if len(failed_pages) > 10:
                 print(f"  ... and {len(failed_pages) - 10} more failures")
-        else:
-            print_colored("All pages deleted successfully!", 'GREEN')
-        
+
+        if folder_failed:
+            print()
+            print_colored("Failed folders:", 'RED')
+            for item in folder_failed[:10]:
+                print(f"  - ID: {item['id']}")
+                print(f"    Error: {item['error']}")
+            if len(folder_failed) > 10:
+                print(f"  ... and {len(folder_failed) - 10} more failures")
+
+        if failed_count == 0 and not folder_failed:
+            print_colored("All content deleted successfully!", 'GREEN')
+
         print()
         print_colored(f"Space '{space_key}' has been cleaned.", 'GREEN')
     
