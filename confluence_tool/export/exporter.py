@@ -63,11 +63,15 @@ class ConfluenceExporter:
             # Export space metadata
             space_info = self._export_space_metadata(space_key, export_dir)
             
-            # Export folders and databases if available (Cloud only via v2 API)
-            space_id = space_info.get('id')
-            if space_id:
-                self._export_folders(space_id, export_dir)
-                self._export_databases(space_id, export_dir)
+            # Export folders and databases if available (Cloud only via v2 API).
+            # The v2 folders/databases endpoints require the v2-format space ID,
+            # which differs from the legacy integer ID returned by the v1 API.
+            # Fetch the v2 ID explicitly; fall back to v1 ID if unavailable.
+            space_id_v2 = self.client.get_space_id_v2(space_key)
+            folder_db_space_id = space_id_v2 or space_info.get('id')
+            if folder_db_space_id:
+                self._export_folders(folder_db_space_id, export_dir)
+                self._export_databases(folder_db_space_id, export_dir)
             
             # Get all pages in the space
             pages = self.client.get_all_space_content(space_key, 'page')

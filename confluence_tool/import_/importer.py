@@ -92,8 +92,12 @@ class ConfluenceImporter:
             # Verify target space exists
             self._verify_target_space(target_space_key)
 
-            # Cache the numeric space ID for v2 API operations (folders, databases)
-            self.target_space_id = self.client.get_space_id(target_space_key)
+            # Cache the v2-format space ID for v2 API operations (folders, databases).
+            # The v1 integer ID causes 500 errors on Atlassian Cloud v2 endpoints.
+            self.target_space_id = (
+                self.client.get_space_id_v2(target_space_key)
+                or self.client.get_space_id(target_space_key)
+            )
 
             # Import folders first (if available)
             folders_dir = os.path.join(export_dir, 'folders')
@@ -270,8 +274,11 @@ class ConfluenceImporter:
             
             logger.info(f"Found {len(folders)} folders to import")
             
-            # Get space ID for the target space
-            space_id = self.client.get_space_id(space_key)
+            # Use the cached v2 space ID if available; otherwise fetch it.
+            space_id = self.target_space_id or (
+                self.client.get_space_id_v2(space_key)
+                or self.client.get_space_id(space_key)
+            )
             if not space_id:
                 logger.warning(f"Could not get space ID for {space_key}, skipping folder import")
                 return
@@ -395,7 +402,10 @@ class ConfluenceImporter:
                 f"Note: database data (rows/columns) cannot be restored via API."
             )
 
-            space_id = self.target_space_id or self.client.get_space_id(space_key)
+            space_id = self.target_space_id or (
+                self.client.get_space_id_v2(space_key)
+                or self.client.get_space_id(space_key)
+            )
             if not space_id:
                 logger.warning(f"Could not get space ID for {space_key}, skipping database import")
                 return

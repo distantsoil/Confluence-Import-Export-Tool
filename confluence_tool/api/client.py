@@ -661,10 +661,10 @@ class ConfluenceAPIClient:
             logger.error(f"Failed to delete page {page_id}: {e}")
     def get_space_id(self, space_key: str) -> Optional[str]:
         """Get space ID from space key.
-        
+
         Args:
             space_key: Space key
-        
+
         Returns:
             Space ID or None if not found
         """
@@ -674,7 +674,41 @@ class ConfluenceAPIClient:
         except Exception as e:
             logger.warning(f"Could not get space ID for {space_key}: {e}")
             return None
-    
+
+    def get_space_id_v2(self, space_key: str) -> Optional[str]:
+        """Get the v2-format space ID for use with the Confluence v2 API.
+
+        The v1 REST API returns a legacy integer space ID (e.g. 131309).
+        The v2 REST API (folders, databases, etc.) requires the v2 space ID
+        which is retrieved from GET /wiki/api/v2/spaces?keys={space_key}.
+        These IDs are often different; passing the v1 ID to v2 endpoints
+        causes a 500 Internal Server Error from Atlassian.
+
+        Args:
+            space_key: Space key (e.g. 'KB')
+
+        Returns:
+            v2 space ID string, or None if not available
+        """
+        try:
+            v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+            url = urljoin(self.base_url, f"{v2_api_path}spaces")
+            self._rate_limit()
+            response = self.session.get(
+                url,
+                params={'keys': space_key, 'limit': 1},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            results = response.json().get('results', [])
+            if results:
+                v2_id = str(results[0].get('id', ''))
+                logger.debug(f"v2 space ID for '{space_key}': {v2_id}")
+                return v2_id
+        except Exception as e:
+            logger.debug(f"Could not get v2 space ID for {space_key}: {e}")
+        return None
+
     def get_folders(self, space_id: str) -> List[Dict[str, Any]]:
         """Get folders in a space using v2 API.
         
