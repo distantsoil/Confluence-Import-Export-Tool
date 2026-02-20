@@ -173,39 +173,51 @@ class ConfluenceExporter:
     
     def _export_folders(self, space_id: str, export_dir: str) -> None:
         """Export folders from a space.
-        
+
+        Uses discovery via v2 page-parent relationships (get_folders populates
+        client._v2_page_parents as a side-effect).  Saves:
+          - folders/folders_metadata.json  — folder hierarchy
+          - v2_page_parents.json           — {page_id: {parentId, parentType}}
+                                             so the importer knows which pages
+                                             sit under folders vs regular pages.
+
         Args:
             space_id: Space ID
             export_dir: Export directory path
         """
         try:
-            # Get all folders in the space
             folders = self.client.get_folders(space_id)
-            
+
+            # Always save v2 page-parent data when available — the importer
+            # needs it to correctly place pages under folders.
+            v2_page_parents = getattr(self.client, '_v2_page_parents', {})
+            if v2_page_parents:
+                v2_parents_file = os.path.join(export_dir, 'v2_page_parents.json')
+                with open(v2_parents_file, 'w', encoding='utf-8') as f:
+                    json.dump(v2_page_parents, f, indent=2, ensure_ascii=False)
+                logger.info(
+                    f"Saved v2 parent info for {len(v2_page_parents)} pages "
+                    f"to {v2_parents_file}"
+                )
+
             if not folders:
-                logger.info("No folders found in space (may not be available in this Confluence instance)")
+                logger.info("No folders found in space")
                 return
-            
+
             logger.info(f"Found {len(folders)} folders to export")
-            
-            # Create folders directory
+
             folders_dir = os.path.join(export_dir, 'folders')
             os.makedirs(folders_dir, exist_ok=True)
-            
-            # Save folders metadata as JSON
+
             folders_metadata_file = os.path.join(folders_dir, 'folders_metadata.json')
             with open(folders_metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(folders, f, indent=2, ensure_ascii=False)
-            
-            # Update export stats
+
             self.export_stats['folders_exported'] = len(folders)
-            
             logger.info(f"Exported {len(folders)} folders to {folders_metadata_file}")
-            
+
         except Exception as e:
-            error_msg = f"Failed to export folders: {e}"
-            logger.warning(error_msg)
-            # Don't add to errors as folders may not be available in all instances
+            logger.warning(f"Failed to export folders: {e}")
             logger.debug(f"Folder export error details: {e}", exc_info=True)
 
     def _export_databases(self, space_id: str, export_dir: str) -> None:

@@ -46,6 +46,9 @@ class ConfluenceImporter:
         self.folder_mapping = {}    # Maps old folder IDs to new folder IDs
         self.database_mapping = {}  # Maps old database IDs to new database IDs
         self.target_space_id = None  # Numeric space ID for the target space (v2 API)
+        # {old_page_id: {"parentId": old_parent_id, "parentType": "folder"|"page"|…}}
+        # Loaded from v2_page_parents.json when present in the export.
+        self.v2_page_parents: Dict[str, Any] = {}
         self.content_rewriter = None  # Will be set if space key remapping is enabled
         self.remapping_stats = {
             'links_rewritten': 0,
@@ -110,6 +113,20 @@ class ConfluenceImporter:
             if os.path.exists(databases_dir):
                 self._import_databases(databases_dir, target_space_key)
             
+            # Load v2 page-parent data if present (produced by the folder exporter).
+            # Used to reliably detect folder parents during page import, since
+            # the v1 ancestors array may not include folder ancestors.
+            v2_parents_file = os.path.join(export_dir, 'v2_page_parents.json')
+            if os.path.exists(v2_parents_file):
+                try:
+                    with open(v2_parents_file, 'r', encoding='utf-8') as f:
+                        self.v2_page_parents = json.load(f)
+                    logger.info(
+                        f"Loaded v2 parent info for {len(self.v2_page_parents)} pages"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load v2_page_parents.json: {e}")
+
             # Import pages
             pages_dir = os.path.join(export_dir, 'pages')
             if os.path.exists(pages_dir):
@@ -940,28 +957,53 @@ This placeholder was created to preserve the organizational structure of the fol
             # If the intended parent is a folder or database, the v1 create_page
             # endpoint cannot place pages there directly.  Use the v1 move
             # endpoint as the confirmed workaround (Cloud only).
-            if parent_id:
+            #
+            # Detection priority:
+            #   1. v2_page_parents (authoritative — folders only exist in v2 API)
+            #   2. v1 ancestors fallback (covers databases and any edge cases)
+            move_target_id = None
+            move_parent_type = None
+
+            # 1. v2 parent info (primary)
+            if self.v2_page_parents and old_page_id:
+                v2_info = self.v2_page_parents.get(str(old_page_id), {})
+                v2_parent_type = v2_info.get('parentType')
+                v2_old_parent_id = str(v2_info.get('parentId', '')) if v2_info.get('parentId') else None
+                if v2_parent_type == 'folder' and v2_old_parent_id:
+                    if v2_old_parent_id in self.folder_mapping:
+                        move_target_id = self.folder_mapping[v2_old_parent_id]
+                        move_parent_type = 'folder'
+                elif v2_parent_type == 'folder' and v2_old_parent_id:
+                    # parentType folder but not in folder_mapping — folder not yet imported
+                    logger.warning(
+                        f"Page '{title}' has a folder parent (ID: {v2_old_parent_id}) "
+                        f"that was not found in the folder mapping. "
+                        f"It may not have been exported/imported correctly."
+                    )
+
+            # 2. v1 ancestors fallback (databases, and spaces without v2 parent data)
+            if not move_target_id:
                 ancestors = metadata.get('ancestors', [])
                 old_parent_id = ancestors[-1].get('id') if ancestors else None
                 if old_parent_id:
-                    is_folder_parent = old_parent_id in self.folder_mapping
-                    is_database_parent = old_parent_id in self.database_mapping
-                    if is_folder_parent or is_database_parent:
-                        parent_type = 'folder' if is_folder_parent else 'database'
-                        moved = self.client.move_content(
-                            new_page['id'], parent_id, position='append'
-                        )
-                        if moved:
-                            logger.info(
-                                f"Moved '{title}' into {parent_type} "
-                                f"(ID: {parent_id})"
-                            )
-                        else:
-                            logger.warning(
-                                f"Could not move '{title}' into {parent_type} "
-                                f"(ID: {parent_id}); page remains at its default "
-                                f"position. This is a Cloud-only feature."
-                            )
+                    if old_parent_id in self.folder_mapping:
+                        move_target_id = self.folder_mapping[old_parent_id]
+                        move_parent_type = 'folder'
+                    elif old_parent_id in self.database_mapping:
+                        move_target_id = self.database_mapping[old_parent_id]
+                        move_parent_type = 'database'
+
+            if move_target_id:
+                moved = self.client.move_content(
+                    new_page['id'], move_target_id, position='append'
+                )
+                if moved:
+                    logger.info(f"Moved '{title}' into {move_parent_type} (ID: {move_target_id})")
+                else:
+                    logger.warning(
+                        f"Could not move '{title}' into {move_parent_type} "
+                        f"(ID: {move_target_id}); page remains at its default position."
+                    )
 
             # Import attachments if enabled
             if self.config.get('import_attachments', True):

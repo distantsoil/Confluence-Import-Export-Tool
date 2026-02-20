@@ -711,109 +711,127 @@ class ConfluenceAPIClient:
         return None
 
     def get_folders(self, space_id: str) -> List[Dict[str, Any]]:
-        """Get folders in a space using v2 API.
-        
+        """Discover folders in a space via v2 page-parent relationships.
+
+        The GET /wiki/api/v2/folders?space-id={id} endpoint returns 500 on
+        many Confluence Cloud tenants regardless of the space ID format.
+        This method uses a discovery approach instead:
+
+          1. Fetch all pages in the space via GET /wiki/api/v2/pages?space-id={id}.
+             Each page carries parentId and parentType fields.
+          2. Collect the parentId of every page whose parentType is "folder".
+          3. Fetch each discovered folder via GET /wiki/api/v2/folders/{id}.
+          4. Walk up: if a folder's own parentType is "folder", enqueue its
+             parentId so ancestor folders are also captured.
+
+        As a side-effect, populates self._v2_page_parents with a mapping of
+        {page_id -> {"parentId": ..., "parentType": ...}} so the exporter can
+        save this alongside page metadata for use during import.
+
         Args:
-            space_id: Space ID (not space key)
-        
+            space_id: Space ID
+
         Returns:
-            List of folder dictionaries
-        
-        Raises:
-            requests.exceptions.RequestException: On request failure
-        
-        Notes:
-            Folders are only available in Confluence Cloud via the v2 API.
-            The endpoint is /wiki/api/v2/folders with spaceId parameter.
+            List of folder dicts (id, title, parentId, parentType, …)
         """
-        # For v2 API, we need to use a different base path
-        # Construct the v2 API URL directly
-        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
-        v2_url = urljoin(self.base_url, v2_api_path)
-        
-        endpoint_url = urljoin(v2_url, 'folders')
-        
-        params = {
-            'space-id': space_id,  # v2 API uses kebab-case for query parameters
-            'limit': 250  # Maximum allowed by API
-        }
-        
-        all_folders = []
+        from urllib.parse import urlparse, parse_qs
+
+        v2_base = self.base_url + ('/wiki/api/v2/' if self.is_cloud else '/api/v2/')
+
+        # ------------------------------------------------------------------ #
+        # Step 1: page pass — collect v2 parent info and seed folder ID set   #
+        # ------------------------------------------------------------------ #
+        self._v2_page_parents: Dict[str, Any] = {}
+        folder_ids: set = set()
         cursor = None
-        
+
         try:
             while True:
+                params: Dict[str, Any] = {'space-id': space_id, 'limit': 250}
                 if cursor:
                     params['cursor'] = cursor
-                
+
                 self._rate_limit()
-                logger.debug(f"Getting folders from {endpoint_url} with params {params}")
-                
                 response = self.session.get(
-                    endpoint_url,
-                    params=params,
-                    timeout=self.timeout
+                    v2_base + 'pages', params=params, timeout=self.timeout
                 )
                 response.raise_for_status()
-                
                 data = response.json()
-                results = data.get('results', [])
-                all_folders.extend(results)
-                
-                # Check for next page - v2 API may return cursor in _links
-                links = data.get('_links', {})
-                next_link = links.get('next')
-                
+
+                for page in data.get('results', []):
+                    pid = str(page.get('id', ''))
+                    parent_id = str(page.get('parentId', '')) if page.get('parentId') else None
+                    parent_type = page.get('parentType')
+                    self._v2_page_parents[pid] = {
+                        'parentId': parent_id,
+                        'parentType': parent_type,
+                    }
+                    if parent_type == 'folder' and parent_id:
+                        folder_ids.add(parent_id)
+
+                next_link = data.get('_links', {}).get('next')
                 if not next_link:
                     break
-                
-                # If next_link is a full URL, extract cursor from it
-                # If it's just a cursor string, use it directly
-                if isinstance(next_link, str):
-                    if '?' in next_link:
-                        # Extract cursor from query string
-                        from urllib.parse import urlparse, parse_qs
-                        parsed = urlparse(next_link)
-                        query_params = parse_qs(parsed.query)
-                        cursor = query_params.get('cursor', [None])[0]
-                    else:
-                        cursor = next_link
+                if isinstance(next_link, str) and '?' in next_link:
+                    parsed = urlparse(next_link)
+                    cursor = parse_qs(parsed.query).get('cursor', [None])[0]
                 else:
-                    break
-                
+                    cursor = next_link if isinstance(next_link, str) else None
                 if not cursor:
                     break
-                
-                logger.debug(f"Retrieved {len(all_folders)} folders so far...")
-            
-            logger.info(f"Retrieved {len(all_folders)} total folders from space {space_id}")
-            return all_folders
-            
+
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
-            if status == 404:
-                logger.info("Folders API not available (likely Server/DC or old Cloud instance)")
-                return []
-            elif status == 405:
-                logger.info("Folders API method not allowed (likely Server/DC instance)")
-                return []
-            elif status == 500:
-                # Confluence Cloud returns 500 (not 400) for unrecognised query parameters.
-                # Log the response body to aid diagnosis.
-                body = ''
-                try:
-                    body = e.response.text[:500]
-                except Exception:
-                    pass
-                logger.warning(
-                    f"Folders API returned 500 for space {space_id}. "
-                    f"Response: {body or '(no body)'}"
-                )
-                return []
-            raise
-        except Exception as e:
-            logger.warning(f"Error retrieving folders: {e}")
+            if status in (404, 405):
+                logger.info("v2 pages API not available; cannot discover folders")
+            else:
+                logger.warning(f"Error fetching pages for folder discovery (HTTP {status}): {e}")
             return []
+        except Exception as e:
+            logger.warning(f"Error fetching pages for folder discovery: {e}")
+            return []
+
+        if not folder_ids:
+            logger.info("No pages with folder parents found in space — no folders to export")
+            return []
+
+        logger.info(
+            f"Found {len(folder_ids)} unique folder parent(s) across "
+            f"{len(self._v2_page_parents)} pages; fetching folder details…"
+        )
+
+        # ------------------------------------------------------------------ #
+        # Step 2: fetch each folder, recursively walk up to ancestor folders  #
+        # ------------------------------------------------------------------ #
+        all_folders: Dict[str, Any] = {}
+        queue = list(folder_ids)
+
+        while queue:
+            folder_id = queue.pop(0)
+            if folder_id in all_folders:
+                continue
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    v2_base + f'folders/{folder_id}', timeout=self.timeout
+                )
+                if response.status_code == 200:
+                    folder = response.json()
+                    all_folders[folder_id] = folder
+                    # if this folder is itself inside another folder, enqueue the parent
+                    if folder.get('parentType') == 'folder' and folder.get('parentId'):
+                        parent_id = str(folder['parentId'])
+                        if parent_id not in all_folders:
+                            queue.append(parent_id)
+                else:
+                    logger.debug(
+                        f"Could not fetch folder {folder_id}: HTTP {response.status_code}"
+                    )
+            except Exception as e:
+                logger.debug(f"Error fetching folder {folder_id}: {e}")
+
+        logger.info(f"Discovered {len(all_folders)} folder(s) in space {space_id}")
+        return list(all_folders.values())
     
     def create_folder(self, space_id: str, folder_name: str, 
                      parent_id: str = None) -> Dict[str, Any]:
