@@ -301,9 +301,14 @@ class ConfluenceImporter:
                 return
             
             # Sort folders by hierarchy (parents first)
-            # Folders without parentId should be imported first
-            root_folders = [f for f in folders if not f.get('parentId')]
-            child_folders = [f for f in folders if f.get('parentId')]
+            # Root folders have parentType == "space" (or no parentType/parentId).
+            # Child folders have parentType == "folder".
+            # NOTE: Confluence v2 folder objects always have a parentId even for
+            # space-root folders (parentId is the space ID in that case), so we
+            # must use parentType rather than the mere presence of parentId to
+            # distinguish root from child folders.
+            root_folders = [f for f in folders if f.get('parentType') != 'folder']
+            child_folders = [f for f in folders if f.get('parentType') == 'folder']
             
             # Import root folders first
             for folder in root_folders:
