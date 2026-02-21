@@ -5,8 +5,6 @@ A comprehensive Python tool for exporting and importing Confluence spaces using 
 ## Upated February 21, 2026 - Now supports folders!
 - A performance update is the next major milestone to hit and will be in progress soon
 
----
-
 ## :question: About this project 
 ### Why did I make this?
 Confluence allows you to import a space natively, but it doesn't allow you to alter the space key while or before you import. If you have conflcting spaces, you're stuck. It also doesn't update links quite as well as I had hoped. 
@@ -18,9 +16,11 @@ I've been a long time lover and user of confluence, so I was able to test with m
 Less than you think. I'm not an expert with Python by any means, so I got 70-80% of the way there and used a combination of GitHub CoPilot, Claude, and ChatGPT Codex as an aid. It also made this README file, because it's better at structuring that information than I am. This wasn't vibe coded, but it was an assistive tool.
 
 ### Does your company use Confluence? and why am I pointing this out?
-Yes, the company I work for uses Confluence, and part of the motiviation for me writing this was a problem I saw emerging with multiple Confluence spaces that shared the same keys. However I did not ever connect to or test this tool with any of the company systems, or using company technology. As an IT professional, you should never use this tool without explicit authorization from your IT team and show them this page so they understand its capabilities. 
+Yes, the company I work for uses Confluence and so have past employers. Part of the motiviation for me writing this was a problem I saw emerging with multiple Confluence spaces that shared the same keys that might need to be consolidated. 
+However I did not **ever** connect to or test this tool with any of the company systems, or using company technology. This is strictly a personal initiative.
+As an IT professional, you should never use this tool without **explicit** authorization from your IT team and show them this page so they understand its capabilities. 
 
-** :coffee: If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
+:coffee: **If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
 
 > [!WARNING]
 > ### Use of AI Disclaimer
