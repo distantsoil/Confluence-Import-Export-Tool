@@ -3,6 +3,9 @@
 A comprehensive Python tool for exporting and importing Confluence spaces using the Confluence REST API. This tool is designed to be robust, user-friendly, and cross-platform compatible.
 
 ## Upated February 21, 2026 - Now supports folders!
+> performance update coming soon
+
+
 
 > [!WARNING]
 > ### Use of AI Disclaimer
