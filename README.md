@@ -3,11 +3,11 @@
 A comprehensive Python tool for exporting and importing Confluence spaces using the Confluence REST API. This tool is designed to be robust, user-friendly, and cross-platform compatible.
 
 ## Upated February 21, 2026 - Now supports folders!
-> performance update coming soon
+- A performance update is the next major milestone to hit and will be in progress soon
 
 ---
 
-## ❓ About this project 
+## :question: About this project 
 ### Why did I make this?
 Confluence allows you to import a space natively, but it doesn't allow you to alter the space key while or before you import. If you have conflcting spaces, you're stuck. It also doesn't update links quite as well as I had hoped. 
 
@@ -20,7 +20,7 @@ Less than you think. I'm not an expert with Python by any means, so I got 70-80%
 ### Does your company use Confluence? and why am I pointing this out?
 Yes, the company I work for uses Confluence, and part of the motiviation for me writing this was a problem I saw emerging with multiple Confluence spaces that shared the same keys. However I did not ever connect to or test this tool with any of the company systems, or using company technology. As an IT professional, you should never use this tool without explicit authorization from your IT team and show them this page so they understand its capabilities. 
 
-**☕️ If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
+** :coffee: If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
 
 > [!WARNING]
 > ### Use of AI Disclaimer
