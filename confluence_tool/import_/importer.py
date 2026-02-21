@@ -47,6 +47,10 @@ class ConfluenceImporter:
         self.page_mapping = {}      # Maps old page IDs to new page IDs
         self.folder_mapping = {}    # Maps old folder IDs to new folder IDs
         self.database_mapping = {}  # Maps old database IDs to new database IDs
+        # Set of all folder IDs present in the export (populated in _import_folders).
+        # Used by _is_parent_available to allow pages whose parent folder hasn't
+        # been created yet to proceed — they'll be moved into the folder later.
+        self._known_folder_ids: set = set()
         self.target_space_id = None  # Numeric space ID for the target space (v2 API)
         # {old_page_id: {"parentId": old_parent_id, "parentType": "folder"|"page"|…}}
         # Loaded from v2_page_parents.json when present in the export.
@@ -142,6 +146,11 @@ class ConfluenceImporter:
             # Import page-parented folders (deferred from folder phase —
             # page_mapping is now fully populated)
             self._import_deferred_folders(target_space_key)
+
+            # Now that folder_mapping is fully populated, move any pages that
+            # were imported to a temporary location (because their folder parent
+            # didn't exist yet during _import_pages) into their correct folders.
+            self._move_pages_to_deferred_folders()
 
             # Create import summary
             self._create_import_summary(export_dir, target_space_key, export_metadata)
@@ -294,7 +303,11 @@ class ConfluenceImporter:
             if not folders:
                 logger.info("No folders to import")
                 return
-            
+
+            # Record all export folder IDs so _is_parent_available can allow
+            # pages through even when the folder hasn't been created yet.
+            self._known_folder_ids = {str(f.get('id')) for f in folders if f.get('id')}
+
             logger.info(f"Found {len(folders)} folders to import")
             
             # Use the cached v2 space ID if available; otherwise fetch it.
@@ -481,6 +494,85 @@ class ConfluenceImporter:
         logger.info(
             f"Deferred folder import complete. "
             f"Total folders imported: {self.import_stats['folders_imported']}"
+        )
+
+    def _move_pages_to_deferred_folders(self) -> None:
+        """Move pages into folders that were created in the deferred folder phase.
+
+        During _import_pages, folders whose parent is a page cannot be created
+        yet (the page might not exist), so they are deferred.  That means
+        folder_mapping is empty while pages are being imported, and pages whose
+        v2 parent is one of those deferred folders are imported to a temporary
+        location (space root or their nearest v1 page ancestor).
+
+        This method is called after _import_deferred_folders has populated
+        folder_mapping.  It sweeps v2_page_parents and calls move_content for
+        every page whose v2 parent folder is now resolvable.
+        """
+        if not self.v2_page_parents or not self.folder_mapping:
+            return
+
+        moved = 0
+        failed = 0
+        skipped = 0
+
+        logger.info("Starting deferred page-to-folder moves...")
+
+        for old_page_id_str, v2_info in self.v2_page_parents.items():
+            if v2_info.get('parentType') != 'folder':
+                continue
+
+            v2_old_parent_id = (
+                str(v2_info['parentId']) if v2_info.get('parentId') is not None else None
+            )
+            if not v2_old_parent_id:
+                continue
+
+            new_folder_id = self.folder_mapping.get(v2_old_parent_id)
+            if not new_folder_id:
+                skipped += 1
+                logger.debug(
+                    f"Page {old_page_id_str}: folder {v2_old_parent_id} not in "
+                    f"folder_mapping — folder may not have been imported"
+                )
+                continue
+
+            new_page_id = self.page_mapping.get(old_page_id_str)
+            if not new_page_id:
+                skipped += 1
+                logger.debug(
+                    f"Page {old_page_id_str}: not in page_mapping — page may not "
+                    f"have been imported"
+                )
+                continue
+
+            try:
+                moved_ok = self.client.move_content(
+                    new_page_id, new_folder_id, position='append'
+                )
+                if moved_ok:
+                    moved += 1
+                    logger.debug(
+                        f"Moved page {new_page_id} (old: {old_page_id_str}) "
+                        f"into folder {new_folder_id} (old: {v2_old_parent_id})"
+                    )
+                else:
+                    failed += 1
+                    logger.warning(
+                        f"Could not move page {new_page_id} (old: {old_page_id_str}) "
+                        f"into folder {new_folder_id} (old: {v2_old_parent_id}); "
+                        f"page remains at its current location"
+                    )
+            except Exception as e:
+                failed += 1
+                logger.warning(
+                    f"Error moving page {new_page_id} (old: {old_page_id_str}) "
+                    f"into folder {new_folder_id}: {e}"
+                )
+
+        logger.info(
+            f"Deferred page-to-folder moves complete: "
+            f"{moved} moved, {failed} failed, {skipped} skipped (no mapping)"
         )
 
     def _import_databases(self, databases_dir: str, space_key: str) -> None:
@@ -1377,6 +1469,14 @@ This placeholder was created to preserve the organizational structure of the fol
             if existing_parent:
                 self.page_mapping[old_parent_id] = existing_parent['id']
                 return True
+
+        # If the parent is a known folder from the export that hasn't been created
+        # yet (because it depends on a page parent — the chicken-and-egg problem),
+        # allow the page through now.  It will be placed at a temporary location
+        # and then moved into the correct folder by _move_pages_to_deferred_folders()
+        # after _import_deferred_folders() has run.
+        if old_parent_id in self._known_folder_ids:
+            return True
 
         # Parent not available yet
         return False
