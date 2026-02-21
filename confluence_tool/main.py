@@ -837,7 +837,7 @@ def clean_space(ctx, space_key, dry_run, target_config):
             space_id_v2 = client.get_space_id_v2(space_key)
             if space_id_v2:
                 print_colored(f"  v2 space ID: {space_id_v2}", 'WHITE')
-                folders = client.get_folders(space_id_v2)
+                folders = client.get_folders(space_id_v2, space_key=space_key)
                 print_colored(f"  Folders found: {len(folders)}", 'WHITE')
             else:
                 print_colored("  Warning: could not resolve v2 space ID — folder discovery skipped.", 'YELLOW')

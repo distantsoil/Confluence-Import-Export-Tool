@@ -742,7 +742,7 @@ class ConfluenceAPIClient:
             logger.warning(f"Could not get v2 space ID for {space_key}: {e}")
         return None
 
-    def get_folders(self, space_id: str) -> List[Dict[str, Any]]:
+    def get_folders(self, space_id: str, space_key: str = None) -> List[Dict[str, Any]]:
         """Discover folders in a space via v2 page-parent relationships.
 
         The GET /wiki/api/v2/folders?space-id={id} endpoint returns 500 on
@@ -828,7 +828,7 @@ class ConfluenceAPIClient:
                 "No pages with folder parents found in space — "
                 "trying direct folder API fallback (BFS from space root)"
             )
-            return self._get_folders_by_bfs(space_id, v2_base)
+            return self._get_folders_by_bfs(space_id, v2_base, space_key=space_key)
 
         logger.info(
             f"Found {len(folder_ids)} unique folder parent(s) across "
@@ -868,28 +868,38 @@ class ConfluenceAPIClient:
         logger.info(f"Discovered {len(all_folders)} folder(s) in space {space_id}")
         return list(all_folders.values())
     
-    def _get_folders_by_bfs(self, space_id: str, v2_base: str) -> List[Dict[str, Any]]:
+    def _get_folders_by_bfs(self, space_id: str, v2_base: str,
+                            space_key: str = None) -> List[Dict[str, Any]]:
         """BFS fallback for get_folders when the space has no pages.
 
-        Tries three strategies in order, stopping at the first that yields results:
+        Tries four strategies in order, stopping at the first that yields results:
 
           1. GET /wiki/api/v2/folders?space-id={id}   — returns all folders in one
              shot (paginated). Returns 500 on some tenants; skipped if so.
           2. GET /wiki/api/v2/folders?parentId={space_id} — root-level folders whose
              parent is the space, then recursively GET …?parentId={folder_id}.
-          3. (no further fallback) — log diagnostic info and return [].
+          3. GET /wiki/api/v2/folders (no filter) — fetches all accessible folders,
+             filtered client-side by spaceId. Works when filter params cause 500.
+          4. v1 CQL search: GET /wiki/rest/api/content/search?cql=type="folder"
+             AND space.key="{space_key}". Requires space_key to be provided.
 
         Args:
-            space_id: v2 space ID
-            v2_base:  base URL for the v2 API (already constructed by caller)
+            space_id:  v2 space ID
+            v2_base:   base URL for the v2 API (already constructed by caller)
+            space_key: optional space key, used by strategy 4
 
         Returns:
             List of folder dicts, or [] if all strategies are unavailable.
         """
         from urllib.parse import urlparse, parse_qs
 
-        def _paginate(params: Dict[str, Any]) -> List[Dict[str, Any]]:
-            """Fetch all pages of results for the given params; return [] on error."""
+        def _paginate(params: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+            """Fetch all pages for the given params.
+
+            Returns:
+                List of folder dicts on success (may be empty),
+                None if the API returned a non-200 status or raised an exception.
+            """
             results: List[Dict[str, Any]] = []
             cursor = None
             while True:
@@ -903,11 +913,11 @@ class ConfluenceAPIClient:
                     )
                     print(f"    [folder API] GET folders {p} → HTTP {resp.status_code}")
                     if resp.status_code != 200:
-                        return []
+                        return None
                     data = resp.json()
                 except Exception as exc:
                     print(f"    [folder API] error for {p}: {exc}")
-                    return []
+                    return None
 
                 batch = data.get('results', [])
                 print(f"    [folder API] {len(batch)} result(s) in this page")
@@ -936,7 +946,7 @@ class ConfluenceAPIClient:
         while queue:
             parent_id = queue.pop(0)
             page_results = _paginate({'parentId': parent_id, 'limit': 250})
-            for folder in page_results:
+            for folder in (page_results or []):
                 fid = str(folder.get('id', ''))
                 if fid and fid not in all_folders:
                     all_folders[fid] = folder
@@ -944,13 +954,91 @@ class ConfluenceAPIClient:
 
         if all_folders:
             print(f"  [folder discovery] strategy 2 found {len(all_folders)} folder(s)")
+            return list(all_folders.values())
+
+        # ── Strategy 3: no filter — list all accessible folders, filter here ─ #
+        # Some tenants return 500 for any filter param but serve the unfiltered
+        # endpoint fine.  We paginate everything and match by spaceId client-side.
+        print(
+            f"  [folder discovery] strategy 3: no-filter listing, "
+            f"client-side filter by spaceId={space_id}"
+        )
+        all_unfiltered = _paginate({'limit': 250})
+        if all_unfiltered is not None:
+            space_folders = [
+                f for f in all_unfiltered
+                if str(f.get('spaceId', '')) == space_id
+            ]
+            if space_folders:
+                print(
+                    f"  [folder discovery] strategy 3 found {len(space_folders)} folder(s) "
+                    f"(from {len(all_unfiltered)} total across all spaces)"
+                )
+                return space_folders
+            elif all_unfiltered:
+                print(
+                    f"  [folder discovery] strategy 3: {len(all_unfiltered)} total folders "
+                    f"accessible but none matched spaceId={space_id}"
+                )
+            else:
+                print("  [folder discovery] strategy 3: no folders accessible at all")
+
+        # ── Strategy 4: v1 CQL search for type=folder in this space ──────── #
+        if space_key:
+            print(
+                f"  [folder discovery] strategy 4: v1 CQL "
+                f'type="folder" AND space.key="{space_key}"'
+            )
+            v1_base = self.base_url + self.api_path
+            cql = f'type="folder" AND space.key="{space_key}"'
+            try:
+                self._rate_limit()
+                resp = self.session.get(
+                    v1_base + 'content/search',
+                    params={'cql': cql, 'limit': 250},
+                    timeout=self.timeout,
+                )
+                print(f"    [folder API v1 CQL] → HTTP {resp.status_code}")
+                if resp.status_code == 200:
+                    v1_results = resp.json().get('results', [])
+                    print(f"    [folder API v1 CQL] {len(v1_results)} result(s)")
+                    if v1_results:
+                        # Map v1 content objects to a v2-like shape so the
+                        # rest of the pipeline (delete_folder) can use them.
+                        folders_v1 = [
+                            {
+                                'id': str(r.get('id', '')),
+                                'title': r.get('title', ''),
+                                'spaceId': space_id,
+                            }
+                            for r in v1_results
+                            if r.get('id')
+                        ]
+                        print(
+                            f"  [folder discovery] strategy 4 found "
+                            f"{len(folders_v1)} folder(s) via v1 CQL"
+                        )
+                        return folders_v1
+                else:
+                    try:
+                        err_body = resp.text[:300]
+                    except Exception:
+                        err_body = ''
+                    print(
+                        f"    [folder API v1 CQL] failed: HTTP {resp.status_code} {err_body}"
+                    )
+            except Exception as exc:
+                print(f"    [folder API v1 CQL] error: {exc}")
         else:
             print(
-                f"  [folder discovery] both strategies returned 0 folders "
-                f"(space_id={space_id}, v2_base={v2_base})"
+                "  [folder discovery] strategy 4 skipped (space_key not available)"
             )
 
-        return list(all_folders.values())
+        print(
+            f"  [folder discovery] all strategies returned 0 folders "
+            f"(space_id={space_id}, v2_base={v2_base})"
+        )
+        return []
 
     def create_folder(self, space_id: str, folder_name: str,
                      parent_id: str = None) -> Dict[str, Any]:
