@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import html
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -11,6 +12,7 @@ import concurrent.futures
 from tqdm import tqdm
 import re
 from html.parser import HTMLParser
+import requests
 
 from ..api.client import ConfluenceAPIClient
 from ..utils.helpers import sanitize_filename
@@ -36,13 +38,23 @@ class ConfluenceImporter:
             'pages_updated': 0,
             'pages_skipped': 0,
             'folders_imported': 0,
+            'databases_imported': 0,
             'attachments_imported': 0,
             'errors': [],
             'start_time': None,
             'end_time': None
         }
-        self.page_mapping = {}  # Maps old page IDs to new page IDs
-        self.folder_mapping = {}  # Maps old folder IDs to new folder IDs
+        self.page_mapping = {}      # Maps old page IDs to new page IDs
+        self.folder_mapping = {}    # Maps old folder IDs to new folder IDs
+        self.database_mapping = {}  # Maps old database IDs to new database IDs
+        # Set of all folder IDs present in the export (populated in _import_folders).
+        # Used by _is_parent_available to allow pages whose parent folder hasn't
+        # been created yet to proceed — they'll be moved into the folder later.
+        self._known_folder_ids: set = set()
+        self.target_space_id = None  # Numeric space ID for the target space (v2 API)
+        # {old_page_id: {"parentId": old_parent_id, "parentType": "folder"|"page"|…}}
+        # Loaded from v2_page_parents.json when present in the export.
+        self.v2_page_parents: Dict[str, Any] = {}
         self.content_rewriter = None  # Will be set if space key remapping is enabled
         self.remapping_stats = {
             'links_rewritten': 0,
@@ -88,12 +100,39 @@ class ConfluenceImporter:
             
             # Verify target space exists
             self._verify_target_space(target_space_key)
-            
+
+            # Cache the v2-format space ID for v2 API operations (folders, databases).
+            # The v1 integer ID causes 500 errors on Atlassian Cloud v2 endpoints.
+            self.target_space_id = (
+                self.client.get_space_id_v2(target_space_key)
+                or self.client.get_space_id(target_space_key)
+            )
+
             # Import folders first (if available)
             folders_dir = os.path.join(export_dir, 'folders')
             if os.path.exists(folders_dir):
                 self._import_folders(folders_dir, target_space_key)
+
+            # Import database stubs (if available — Cloud only)
+            # Must happen before pages so database IDs are mapped before child pages import
+            databases_dir = os.path.join(export_dir, 'databases')
+            if os.path.exists(databases_dir):
+                self._import_databases(databases_dir, target_space_key)
             
+            # Load v2 page-parent data if present (produced by the folder exporter).
+            # Used to reliably detect folder parents during page import, since
+            # the v1 ancestors array may not include folder ancestors.
+            v2_parents_file = os.path.join(export_dir, 'v2_page_parents.json')
+            if os.path.exists(v2_parents_file):
+                try:
+                    with open(v2_parents_file, 'r', encoding='utf-8') as f:
+                        self.v2_page_parents = json.load(f)
+                    logger.info(
+                        f"Loaded v2 parent info for {len(self.v2_page_parents)} pages"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load v2_page_parents.json: {e}")
+
             # Import pages
             pages_dir = os.path.join(export_dir, 'pages')
             if os.path.exists(pages_dir):
@@ -103,7 +142,16 @@ class ConfluenceImporter:
             blogposts_dir = os.path.join(export_dir, 'blogposts')
             if os.path.exists(blogposts_dir):
                 self._import_pages(blogposts_dir, target_space_key, content_type='blogpost')
-            
+
+            # Import page-parented folders (deferred from folder phase —
+            # page_mapping is now fully populated)
+            self._import_deferred_folders(target_space_key)
+
+            # Now that folder_mapping is fully populated, move any pages that
+            # were imported to a temporary location (because their folder parent
+            # didn't exist yet during _import_pages) into their correct folders.
+            self._move_pages_to_deferred_folders()
+
             # Create import summary
             self._create_import_summary(export_dir, target_space_key, export_metadata)
             
@@ -115,6 +163,7 @@ class ConfluenceImporter:
                        f"Updated: {self.import_stats['pages_updated']} pages, "
                        f"Skipped: {self.import_stats['pages_skipped']} pages, "
                        f"Folders: {self.import_stats['folders_imported']}, "
+                       f"Database stubs: {self.import_stats['databases_imported']}, "
                        f"Attachments: {self.import_stats['attachments_imported']}")
             
             if self.import_stats['errors']:
@@ -254,44 +303,55 @@ class ConfluenceImporter:
             if not folders:
                 logger.info("No folders to import")
                 return
-            
+
+            # Record all export folder IDs so _is_parent_available can allow
+            # pages through even when the folder hasn't been created yet.
+            self._known_folder_ids = {str(f.get('id')) for f in folders if f.get('id')}
+
             logger.info(f"Found {len(folders)} folders to import")
             
-            # Get space ID for the target space
-            space_id = self.client.get_space_id(space_key)
+            # Use the cached v2 space ID if available; otherwise fetch it.
+            space_id = self.target_space_id or (
+                self.client.get_space_id_v2(space_key)
+                or self.client.get_space_id(space_key)
+            )
             if not space_id:
                 logger.warning(f"Could not get space ID for {space_key}, skipping folder import")
                 return
             
-            # Sort folders by hierarchy (parents first)
-            # Folders without parentId should be imported first
-            root_folders = [f for f in folders if not f.get('parentId')]
-            child_folders = [f for f in folders if f.get('parentId')]
-            
-            # Import root folders first
-            for folder in root_folders:
+            # Confluence folders have three parent types:
+            #   "space"  → sits at the space root (no page/folder parent)
+            #   "folder" → nested inside another folder
+            #   "page"   → nested inside a page
+            #
+            # Page-parented folders must be deferred until after pages are
+            # imported because page_mapping is empty at this point.
+            space_folders  = [f for f in folders if f.get('parentType') not in ('folder', 'page')]
+            folder_folders = [f for f in folders if f.get('parentType') == 'folder']
+            page_folders   = [f for f in folders if f.get('parentType') == 'page']
+
+            # Import space-root folders immediately (no parent ID needed)
+            for folder in space_folders:
                 try:
                     self._import_single_folder(folder, space_id, None)
                 except Exception as e:
                     error_msg = f"Failed to import folder '{folder.get('title', 'Unknown')}': {e}"
                     logger.warning(error_msg)
                     self.import_stats['errors'].append(error_msg)
-            
-            # Import child folders, potentially in multiple passes
-            # since some child folders may have parents that are also children
-            max_passes = 10  # Prevent infinite loops
-            remaining_folders = child_folders.copy()
-            
+
+            # Import folder-in-folder hierarchy via multi-pass
+            # (some children may depend on siblings not yet created)
+            max_passes = 10
+            remaining_folder_children = folder_folders.copy()
+
             for pass_num in range(max_passes):
-                if not remaining_folders:
+                if not remaining_folder_children:
                     break
-                
+
                 imported_in_pass = []
-                
-                for folder in remaining_folders:
+
+                for folder in remaining_folder_children:
                     old_parent_id = folder.get('parentId')
-                    
-                    # Check if parent has been mapped
                     if old_parent_id in self.folder_mapping:
                         new_parent_id = self.folder_mapping[old_parent_id]
                         try:
@@ -301,22 +361,24 @@ class ConfluenceImporter:
                             error_msg = f"Failed to import folder '{folder.get('title', 'Unknown')}': {e}"
                             logger.warning(error_msg)
                             self.import_stats['errors'].append(error_msg)
-                            imported_in_pass.append(folder)  # Remove from list even if failed
-                
-                # Remove successfully processed folders
+                            imported_in_pass.append(folder)
+
                 for folder in imported_in_pass:
-                    remaining_folders.remove(folder)
-                
-                # If no folders were imported in this pass, we can't make progress
+                    remaining_folder_children.remove(folder)
+
                 if not imported_in_pass:
-                    logger.warning(f"Could not import {len(remaining_folders)} folders due to missing parent references")
-                    for folder in remaining_folders:
-                        error_msg = f"Skipped folder '{folder.get('title', 'Unknown')}' due to missing parent"
-                        logger.warning(error_msg)
-                        self.import_stats['errors'].append(error_msg)
-                    break
-            
-            logger.info(f"Imported {self.import_stats['folders_imported']} folders")
+                    break  # No progress — remaining depend on page-parented ancestors
+
+            # Defer anything unresolved: page-parented folders, and any folder-in-folder
+            # chains whose ancestor is a page-parented folder (resolved in phase 2).
+            self._deferred_folders = remaining_folder_children + page_folders
+            if self._deferred_folders:
+                logger.info(
+                    f"Deferring {len(self._deferred_folders)} folder(s) with page parents "
+                    f"until after page import"
+                )
+
+            logger.info(f"Imported {self.import_stats['folders_imported']} folders in phase 1")
             
         except Exception as e:
             error_msg = f"Failed to import folders: {e}"
@@ -351,7 +413,297 @@ class ConfluenceImporter:
         except Exception as e:
             logger.error(f"Error importing folder {folder_title}: {e}")
             raise
-    
+
+    def _import_deferred_folders(self, space_key: str) -> None:
+        """Import folders whose parent is a page (phase 2, called after _import_pages).
+
+        Folders with parentType == "page" cannot be created during the initial
+        folder import because page_mapping is empty at that point.  This method
+        runs after all pages have been imported so that page_mapping is fully
+        populated.
+
+        Also handles folder-in-folder chains whose ancestor is a page-parented
+        folder — these were stuck in phase 1 and are resolved here via the same
+        multi-pass approach.
+        """
+        deferred = getattr(self, '_deferred_folders', [])
+        if not deferred:
+            return
+
+        space_id = self.target_space_id
+        if not space_id:
+            logger.warning("No space ID cached; cannot import deferred folders")
+            return
+
+        logger.info(f"Importing {len(deferred)} deferred folder(s) (phase 2 — after pages)")
+
+        remaining = deferred.copy()
+        max_passes = 10
+
+        for pass_num in range(max_passes):
+            if not remaining:
+                break
+
+            imported_in_pass = []
+
+            for folder in remaining:
+                old_parent_id = folder.get('parentId')
+                parent_type   = folder.get('parentType')
+
+                new_parent_id = None
+                if parent_type == 'page':
+                    # Parent is a page — must be in page_mapping by now.
+                    # page_mapping keys are stored as strings.
+                    str_pid = str(old_parent_id) if old_parent_id is not None else None
+                    if str_pid and str_pid in self.page_mapping:
+                        new_parent_id = self.page_mapping[str_pid]
+                    elif old_parent_id in self.folder_mapping:
+                        new_parent_id = self.folder_mapping[old_parent_id]
+                    else:
+                        continue  # Parent page not yet in mapping
+                elif parent_type == 'folder':
+                    if old_parent_id in self.folder_mapping:
+                        new_parent_id = self.folder_mapping[old_parent_id]
+                    else:
+                        continue  # Parent folder not yet created in this phase
+                else:
+                    new_parent_id = None  # Unexpected type — fall back to space root
+
+                try:
+                    self._import_single_folder(folder, space_id, new_parent_id)
+                    imported_in_pass.append(folder)
+                except Exception as e:
+                    error_msg = f"Failed to import folder '{folder.get('title', 'Unknown')}': {e}"
+                    logger.warning(error_msg)
+                    self.import_stats['errors'].append(error_msg)
+                    imported_in_pass.append(folder)  # Don't retry a hard failure
+
+            for folder in imported_in_pass:
+                remaining.remove(folder)
+
+            if not imported_in_pass:
+                logger.warning(
+                    f"Could not import {len(remaining)} deferred folder(s) — missing parent references"
+                )
+                for folder in remaining:
+                    error_msg = f"Skipped folder '{folder.get('title', 'Unknown')}' due to missing parent"
+                    logger.warning(error_msg)
+                    self.import_stats['errors'].append(error_msg)
+                break
+
+        logger.info(
+            f"Deferred folder import complete. "
+            f"Total folders imported: {self.import_stats['folders_imported']}"
+        )
+
+    def _move_pages_to_deferred_folders(self) -> None:
+        """Move pages into folders that were created in the deferred folder phase.
+
+        During _import_pages, folders whose parent is a page cannot be created
+        yet (the page might not exist), so they are deferred.  That means
+        folder_mapping is empty while pages are being imported, and pages whose
+        v2 parent is one of those deferred folders are imported to a temporary
+        location (space root or their nearest v1 page ancestor).
+
+        This method is called after _import_deferred_folders has populated
+        folder_mapping.  It sweeps v2_page_parents and calls move_content for
+        every page whose v2 parent folder is now resolvable.
+        """
+        if not self.v2_page_parents or not self.folder_mapping:
+            return
+
+        moved = 0
+        failed = 0
+        skipped = 0
+
+        logger.info("Starting deferred page-to-folder moves...")
+
+        for old_page_id_str, v2_info in self.v2_page_parents.items():
+            if v2_info.get('parentType') != 'folder':
+                continue
+
+            v2_old_parent_id = (
+                str(v2_info['parentId']) if v2_info.get('parentId') is not None else None
+            )
+            if not v2_old_parent_id:
+                continue
+
+            new_folder_id = self.folder_mapping.get(v2_old_parent_id)
+            if not new_folder_id:
+                skipped += 1
+                logger.debug(
+                    f"Page {old_page_id_str}: folder {v2_old_parent_id} not in "
+                    f"folder_mapping — folder may not have been imported"
+                )
+                continue
+
+            new_page_id = self.page_mapping.get(old_page_id_str)
+            if not new_page_id:
+                skipped += 1
+                logger.debug(
+                    f"Page {old_page_id_str}: not in page_mapping — page may not "
+                    f"have been imported"
+                )
+                continue
+
+            try:
+                moved_ok = self.client.move_content(
+                    new_page_id, new_folder_id, position='append'
+                )
+                if moved_ok:
+                    moved += 1
+                    logger.debug(
+                        f"Moved page {new_page_id} (old: {old_page_id_str}) "
+                        f"into folder {new_folder_id} (old: {v2_old_parent_id})"
+                    )
+                else:
+                    failed += 1
+                    logger.warning(
+                        f"Could not move page {new_page_id} (old: {old_page_id_str}) "
+                        f"into folder {new_folder_id} (old: {v2_old_parent_id}); "
+                        f"page remains at its current location"
+                    )
+            except Exception as e:
+                failed += 1
+                logger.warning(
+                    f"Error moving page {new_page_id} (old: {old_page_id_str}) "
+                    f"into folder {new_folder_id}: {e}"
+                )
+
+        logger.info(
+            f"Deferred page-to-folder moves complete: "
+            f"{moved} moved, {failed} failed, {skipped} skipped (no mapping)"
+        )
+
+    def _import_databases(self, databases_dir: str, space_key: str) -> None:
+        """Import database stubs from the export directory.
+
+        Recreates the database container hierarchy so that pages which were
+        parented under databases can be moved into them during page import.
+        Database *content* (rows, columns, data) cannot be restored via API
+        and must be re-entered manually in the Confluence UI.
+
+        Args:
+            databases_dir: Path to the databases export directory
+            space_key: Target space key
+        """
+        try:
+            metadata_file = os.path.join(databases_dir, 'databases_metadata.json')
+            if not os.path.exists(metadata_file):
+                logger.info("No databases metadata found, skipping database import")
+                return
+
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                databases = json.load(f)
+
+            if not databases:
+                logger.info("No databases to import")
+                return
+
+            logger.info(
+                f"Found {len(databases)} database stubs to import. "
+                f"Note: database data (rows/columns) cannot be restored via API."
+            )
+
+            space_id = self.target_space_id or (
+                self.client.get_space_id_v2(space_key)
+                or self.client.get_space_id(space_key)
+            )
+            if not space_id:
+                logger.warning(f"Could not get space ID for {space_key}, skipping database import")
+                return
+
+            # Import root databases first (no parentId), then children
+            root_databases = [d for d in databases if not d.get('parentId')]
+            child_databases = [d for d in databases if d.get('parentId')]
+
+            for database in root_databases:
+                try:
+                    self._import_single_database(database, space_id, None)
+                except Exception as e:
+                    error_msg = f"Failed to import database stub '{database.get('title', 'Unknown')}': {e}"
+                    logger.warning(error_msg)
+                    self.import_stats['errors'].append(error_msg)
+
+            # Multi-pass for nested databases (databases inside folders or under other databases)
+            max_passes = 10
+            remaining = child_databases.copy()
+
+            for pass_num in range(max_passes):
+                if not remaining:
+                    break
+
+                imported_in_pass = []
+
+                for database in remaining:
+                    old_parent_id = database.get('parentId')
+
+                    # Resolve parent from any of our mappings
+                    new_parent_id = (
+                        self.database_mapping.get(old_parent_id)
+                        or self.folder_mapping.get(old_parent_id)
+                        or self.page_mapping.get(old_parent_id)
+                    )
+
+                    if new_parent_id:
+                        try:
+                            self._import_single_database(database, space_id, new_parent_id)
+                            imported_in_pass.append(database)
+                        except Exception as e:
+                            error_msg = f"Failed to import database stub '{database.get('title', 'Unknown')}': {e}"
+                            logger.warning(error_msg)
+                            self.import_stats['errors'].append(error_msg)
+                            imported_in_pass.append(database)
+
+                for database in imported_in_pass:
+                    remaining.remove(database)
+
+                if not imported_in_pass:
+                    for database in remaining:
+                        error_msg = (
+                            f"Skipped database stub '{database.get('title', 'Unknown')}' "
+                            f"due to missing parent (ID: {database.get('parentId')})"
+                        )
+                        logger.warning(error_msg)
+                        self.import_stats['errors'].append(error_msg)
+                    break
+
+            logger.info(f"Imported {self.import_stats['databases_imported']} database stubs")
+
+        except Exception as e:
+            error_msg = f"Failed to import databases: {e}"
+            logger.warning(error_msg)
+            logger.debug(f"Database import error details: {e}", exc_info=True)
+
+    def _import_single_database(self, database: Dict[str, Any], space_id: str,
+                                 parent_id: Optional[str]) -> None:
+        """Import a single database stub.
+
+        Args:
+            database: Database metadata dictionary from export
+            space_id: Target space ID (numeric, for v2 API)
+            parent_id: New parent content ID (if any)
+        """
+        old_database_id = database.get('id')
+        database_title = database.get('title', 'Untitled Database')
+
+        try:
+            new_database = self.client.create_database(space_id, database_title, parent_id)
+            new_database_id = new_database.get('id')
+
+            if old_database_id and new_database_id:
+                self.database_mapping[old_database_id] = new_database_id
+
+            self.import_stats['databases_imported'] += 1
+            logger.info(
+                f"Created database stub: '{database_title}' "
+                f"(old ID: {old_database_id}, new ID: {new_database_id})"
+            )
+
+        except Exception as e:
+            logger.error(f"Error importing database stub '{database_title}': {e}")
+            raise
+
     def _import_pages(self, pages_dir: str, space_key: str, content_type: str = 'page') -> None:
             """Import pages from directory.
             
@@ -371,7 +723,19 @@ class ConfluenceImporter:
                 return
             
             logger.info(f"Found {len(page_files)} {content_type}s to import")
-            
+
+            # Notify the user that pages with folder parents will appear at the
+            # space root temporarily while folders are being created.
+            deferred_folder_count = len(getattr(self, '_deferred_folders', []))
+            if deferred_folder_count > 0 or self._known_folder_ids:
+                logger.info(
+                    "NOTE: This space contains folders whose parent pages must be "
+                    "imported before the folders can be created. Pages belonging to "
+                    "those folders will appear at the space root temporarily during "
+                    "import. They will be moved into their correct folders automatically "
+                    "once all pages and folders have been processed — no action required."
+                )
+
             # Load page metadata for all pages
             pages_metadata = self._load_pages_metadata(pages_dir, page_files)
             
@@ -775,20 +1139,74 @@ This placeholder was created to preserve the organizational structure of the fol
             # Determine parent page
             parent_id = self._find_parent_page(metadata, space_key)
     
-            # Create new page
+            # Create new page.
+            # When the intended parent is a folder or database, the v1 API
+            # silently ignores the ancestor and creates the page at root level.
+            # We correct this immediately after creation with a move call.
             new_page = self.client.create_page(space_key, title, content, parent_id)
             logger.info(f"Created new {content_type}: {title}")
             self.import_stats['pages_imported'] += 1
-            
+
             # Map old page ID to new page ID for child page imports
             if old_page_id and old_page_id != '':
                 self.page_mapping[old_page_id] = new_page['id']
                 logger.debug(f"Mapped page ID: {old_page_id} -> {new_page['id']}")
-    
+
+            # If the intended parent is a folder or database, the v1 create_page
+            # endpoint cannot place pages there directly.  Use the v1 move
+            # endpoint as the confirmed workaround (Cloud only).
+            #
+            # Detection priority:
+            #   1. v2_page_parents (authoritative — folders only exist in v2 API)
+            #   2. v1 ancestors fallback (covers databases and any edge cases)
+            move_target_id = None
+            move_parent_type = None
+
+            # 1. v2 parent info (primary)
+            if self.v2_page_parents and old_page_id:
+                v2_info = self.v2_page_parents.get(str(old_page_id), {})
+                v2_parent_type = v2_info.get('parentType')
+                v2_old_parent_id = str(v2_info.get('parentId', '')) if v2_info.get('parentId') else None
+                if v2_parent_type == 'folder' and v2_old_parent_id:
+                    if v2_old_parent_id in self.folder_mapping:
+                        move_target_id = self.folder_mapping[v2_old_parent_id]
+                        move_parent_type = 'folder'
+                elif v2_parent_type == 'folder' and v2_old_parent_id:
+                    # parentType folder but not in folder_mapping — folder not yet imported
+                    logger.warning(
+                        f"Page '{title}' has a folder parent (ID: {v2_old_parent_id}) "
+                        f"that was not found in the folder mapping. "
+                        f"It may not have been exported/imported correctly."
+                    )
+
+            # 2. v1 ancestors fallback (databases, and spaces without v2 parent data)
+            if not move_target_id:
+                ancestors = metadata.get('ancestors', [])
+                old_parent_id = ancestors[-1].get('id') if ancestors else None
+                if old_parent_id:
+                    if old_parent_id in self.folder_mapping:
+                        move_target_id = self.folder_mapping[old_parent_id]
+                        move_parent_type = 'folder'
+                    elif old_parent_id in self.database_mapping:
+                        move_target_id = self.database_mapping[old_parent_id]
+                        move_parent_type = 'database'
+
+            if move_target_id:
+                moved = self.client.move_content(
+                    new_page['id'], move_target_id, position='append'
+                )
+                if moved:
+                    logger.info(f"Moved '{title}' into {move_parent_type} (ID: {move_target_id})")
+                else:
+                    logger.warning(
+                        f"Could not move '{title}' into {move_parent_type} "
+                        f"(ID: {move_target_id}); page remains at its default position."
+                    )
+
             # Import attachments if enabled
             if self.config.get('import_attachments', True):
                 self._import_page_attachments(new_page['id'], pages_dir, filename, title)
-    
+
             return new_page['id']
     
         except Exception as e:
@@ -1044,14 +1462,18 @@ This placeholder was created to preserve the organizational structure of the fol
         parent_info = ancestors[-1]
         old_parent_id = parent_info.get('id')
         
-        # Check if we've already mapped this parent (could be a page or folder)
+        # Check if we've already mapped this parent (could be a page, folder, or database)
         if old_parent_id in self.page_mapping:
             return True
-        
+
         # Check if this is a folder reference
         if old_parent_id in self.folder_mapping:
             return True
-        
+
+        # Check if this is a database reference
+        if old_parent_id in self.database_mapping:
+            return True
+
         # Try to find parent by title
         parent_title = parent_info.get('title', '')
         if parent_title:
@@ -1059,7 +1481,15 @@ This placeholder was created to preserve the organizational structure of the fol
             if existing_parent:
                 self.page_mapping[old_parent_id] = existing_parent['id']
                 return True
-        
+
+        # If the parent is a known folder from the export that hasn't been created
+        # yet (because it depends on a page parent — the chicken-and-egg problem),
+        # allow the page through now.  It will be placed at a temporary location
+        # and then moved into the correct folder by _move_pages_to_deferred_folders()
+        # after _import_deferred_folders() has run.
+        if old_parent_id in self._known_folder_ids:
+            return True
+
         # Parent not available yet
         return False
     
@@ -1084,14 +1514,18 @@ This placeholder was created to preserve the organizational structure of the fol
         parent_info = ancestors[-1]
         old_parent_id = parent_info.get('id')
         
-        # Check if we've already mapped this parent (could be a page or folder)
+        # Check if we've already mapped this parent (could be a page, folder, or database)
         if old_parent_id in self.page_mapping:
             return self.page_mapping[old_parent_id]
-        
+
         # Check if this is a folder reference
         if old_parent_id in self.folder_mapping:
             return self.folder_mapping[old_parent_id]
-        
+
+        # Check if this is a database reference
+        if old_parent_id in self.database_mapping:
+            return self.database_mapping[old_parent_id]
+
         # Try to find parent by title
         parent_title = parent_info.get('title', '')
         if parent_title:
@@ -1099,9 +1533,20 @@ This placeholder was created to preserve the organizational structure of the fol
             if existing_parent:
                 self.page_mapping[old_parent_id] = existing_parent['id']
                 return existing_parent['id']
-        
-        # Parent not found, return None (page will be created as root page)
-        logger.warning(f"Parent page not found for ancestors: {ancestors}")
+
+        # Parent not found, return None (page will be created as root page).
+        # If the missing parent is a known export folder, this is intentional —
+        # the folder hasn't been created yet and the page will be moved into it
+        # by _move_pages_to_deferred_folders() after folder import completes.
+        # Log at DEBUG to avoid alarming the user with expected warnings.
+        if old_parent_id and old_parent_id in self._known_folder_ids:
+            logger.debug(
+                f"Parent {old_parent_id} ({parent_info.get('title', '?')}) is a "
+                f"deferred folder — page will be placed at root temporarily and "
+                f"moved into the folder after _import_deferred_folders() completes"
+            )
+        else:
+            logger.warning(f"Parent page not found for ancestors: {ancestors}")
         return None
     
     def _should_update_page(self, source_metadata: Dict[str, Any], 
@@ -1171,17 +1616,31 @@ This placeholder was created to preserve the organizational structure of the fol
             if not attachment_files:
                 return
             
-            # Upload each attachment
+            # Upload each attachment (retry up to 3 times on server errors)
             for filename in attachment_files:
-                try:
-                    file_path = os.path.join(attach_dir, filename)
-                    self.client.upload_attachment(page_id, file_path, f"Imported attachment: {filename}")
-                    self.import_stats['attachments_imported'] += 1
-                    logger.debug(f"Uploaded attachment: {filename}")
-                except Exception as e:
-                    error_msg = f"Failed to upload attachment {filename}: {e}"
-                    logger.warning(error_msg)
-                    self.import_stats['errors'].append(error_msg)
+                file_path = os.path.join(attach_dir, filename)
+                for attempt in range(3):
+                    try:
+                        self.client.upload_attachment(page_id, file_path, f"Imported attachment: {filename}")
+                        self.import_stats['attachments_imported'] += 1
+                        logger.debug(f"Uploaded attachment: {filename}")
+                        break
+                    except requests.exceptions.HTTPError as e:
+                        status = e.response.status_code if e.response is not None else None
+                        if status and status >= 500 and attempt < 2:
+                            wait = 2 ** (attempt + 1)  # 2s, 4s
+                            logger.debug(f"Attachment upload attempt {attempt + 1} failed (HTTP {status}) for {filename}, retrying in {wait}s")
+                            time.sleep(wait)
+                        else:
+                            error_msg = f"Failed to upload attachment {filename}: {e}"
+                            logger.warning(error_msg)
+                            self.import_stats['errors'].append(error_msg)
+                            break
+                    except Exception as e:
+                        error_msg = f"Failed to upload attachment {filename}: {e}"
+                        logger.warning(error_msg)
+                        self.import_stats['errors'].append(error_msg)
+                        break
             
             logger.info(f"Imported {len(attachment_files)} attachments for page: {page_title}")
             
@@ -1212,12 +1671,14 @@ This placeholder was created to preserve the organizational structure of the fol
                 'pages_updated': self.import_stats['pages_updated'],
                 'pages_skipped': self.import_stats['pages_skipped'],
                 'folders_imported': self.import_stats['folders_imported'],
+                'databases_imported': self.import_stats['databases_imported'],
                 'attachments_imported': self.import_stats['attachments_imported'],
                 'total_errors': len(self.import_stats['errors'])
             },
             'configuration': self.config,
             'page_mapping': self.page_mapping,
             'folder_mapping': self.folder_mapping,
+            'database_mapping': self.database_mapping,
             'errors': self.import_stats['errors']
         }
         
@@ -1272,6 +1733,7 @@ This placeholder was created to preserve the organizational structure of the fol
             <li class="warning"><strong>Pages Updated:</strong> {summary['statistics']['pages_updated']}</li>
             <li class="warning"><strong>Pages Skipped:</strong> {summary['statistics']['pages_skipped']}</li>
             <li class="success"><strong>Folders Imported:</strong> {summary['statistics']['folders_imported']}</li>
+            <li class="success"><strong>Database Stubs Imported:</strong> {summary['statistics'].get('databases_imported', 0)} (data not restored — re-enter manually in Confluence)</li>
             <li class="success"><strong>Attachments Imported:</strong> {summary['statistics']['attachments_imported']}</li>
             <li class="{'error' if summary['statistics']['total_errors'] > 0 else 'success'}">
                 <strong>Errors:</strong> {summary['statistics']['total_errors']}

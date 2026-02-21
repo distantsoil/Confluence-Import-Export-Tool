@@ -33,6 +33,7 @@ class ConfluenceExporter:
         self.export_stats = {
             'pages_exported': 0,
             'folders_exported': 0,
+            'databases_exported': 0,
             'attachments_exported': 0,
             'comments_exported': 0,
             'errors': [],
@@ -62,10 +63,20 @@ class ConfluenceExporter:
             # Export space metadata
             space_info = self._export_space_metadata(space_key, export_dir)
             
-            # Export folders if available
-            space_id = space_info.get('id')
-            if space_id:
-                self._export_folders(space_id, export_dir)
+            # Export folders and databases if available (Cloud only via v2 API).
+            # The v2 folders/databases endpoints require the v2-format space ID,
+            # which differs from the legacy integer ID returned by the v1 API.
+            # Fetch the v2 ID explicitly; fall back to v1 ID if unavailable.
+            space_id_v1 = space_info.get('id')
+            space_id_v2 = self.client.get_space_id_v2(space_key)
+            folder_db_space_id = space_id_v2 or space_id_v1
+            if folder_db_space_id:
+                logger.info(
+                    f"Using space ID {folder_db_space_id} for folders/databases "
+                    f"(v1={space_id_v1}, v2={space_id_v2})"
+                )
+                self._export_folders(folder_db_space_id, export_dir)
+                self._export_databases(folder_db_space_id, export_dir)
             
             # Get all pages in the space
             pages = self.client.get_all_space_content(space_key, 'page')
@@ -90,6 +101,7 @@ class ConfluenceExporter:
             logger.info(f"Export completed successfully in {duration}")
             logger.info(f"Exported: {self.export_stats['pages_exported']} pages, "
                        f"{self.export_stats['folders_exported']} folders, "
+                       f"{self.export_stats['databases_exported']} database stubs, "
                        f"{self.export_stats['attachments_exported']} attachments, "
                        f"{self.export_stats['comments_exported']} comments")
             
@@ -161,41 +173,97 @@ class ConfluenceExporter:
     
     def _export_folders(self, space_id: str, export_dir: str) -> None:
         """Export folders from a space.
-        
+
+        Uses discovery via v2 page-parent relationships (get_folders populates
+        client._v2_page_parents as a side-effect).  Saves:
+          - folders/folders_metadata.json  — folder hierarchy
+          - v2_page_parents.json           — {page_id: {parentId, parentType}}
+                                             so the importer knows which pages
+                                             sit under folders vs regular pages.
+
         Args:
             space_id: Space ID
             export_dir: Export directory path
         """
         try:
-            # Get all folders in the space
             folders = self.client.get_folders(space_id)
-            
+
+            # Always save v2 page-parent data when available — the importer
+            # needs it to correctly place pages under folders.
+            v2_page_parents = getattr(self.client, '_v2_page_parents', {})
+            if v2_page_parents:
+                v2_parents_file = os.path.join(export_dir, 'v2_page_parents.json')
+                with open(v2_parents_file, 'w', encoding='utf-8') as f:
+                    json.dump(v2_page_parents, f, indent=2, ensure_ascii=False)
+                logger.info(
+                    f"Saved v2 parent info for {len(v2_page_parents)} pages "
+                    f"to {v2_parents_file}"
+                )
+
             if not folders:
-                logger.info("No folders found in space (may not be available in this Confluence instance)")
+                logger.info("No folders found in space")
                 return
-            
+
             logger.info(f"Found {len(folders)} folders to export")
-            
-            # Create folders directory
+
             folders_dir = os.path.join(export_dir, 'folders')
             os.makedirs(folders_dir, exist_ok=True)
-            
-            # Save folders metadata as JSON
+
             folders_metadata_file = os.path.join(folders_dir, 'folders_metadata.json')
             with open(folders_metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(folders, f, indent=2, ensure_ascii=False)
-            
-            # Update export stats
+
             self.export_stats['folders_exported'] = len(folders)
-            
             logger.info(f"Exported {len(folders)} folders to {folders_metadata_file}")
-            
+
         except Exception as e:
-            error_msg = f"Failed to export folders: {e}"
-            logger.warning(error_msg)
-            # Don't add to errors as folders may not be available in all instances
+            logger.warning(f"Failed to export folders: {e}")
             logger.debug(f"Folder export error details: {e}", exc_info=True)
-    
+
+    def _export_databases(self, space_id: str, export_dir: str) -> None:
+        """Export database stubs from a space.
+
+        Exports database metadata (title, id, parentId hierarchy) so that empty
+        database containers can be recreated during import, preserving the
+        sidebar structure.  Database *content* (rows, columns, data) cannot be
+        exported via the REST API and is not captured here.
+
+        Args:
+            space_id: Space ID
+            export_dir: Export directory path
+        """
+        try:
+            databases = self.client.get_databases(space_id)
+
+            if not databases:
+                logger.info(
+                    "No databases found in space "
+                    "(may not be available in this Confluence instance)"
+                )
+                return
+
+            logger.info(f"Found {len(databases)} databases to export (structure only — data cannot be exported via API)")
+
+            databases_dir = os.path.join(export_dir, 'databases')
+            os.makedirs(databases_dir, exist_ok=True)
+
+            databases_metadata_file = os.path.join(databases_dir, 'databases_metadata.json')
+            with open(databases_metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(databases, f, indent=2, ensure_ascii=False)
+
+            self.export_stats['databases_exported'] = len(databases)
+
+            logger.info(
+                f"Exported {len(databases)} database stubs to {databases_metadata_file}. "
+                f"Note: database content (rows/data) was not exported."
+            )
+
+        except Exception as e:
+            error_msg = f"Failed to export databases: {e}"
+            logger.warning(error_msg)
+            # Don't add to errors — databases may not be available in all instances
+            logger.debug(f"Database export error details: {e}", exc_info=True)
+
     def _export_pages(self, pages: List[Dict[str, Any]], export_dir: str, 
                      content_type: str = 'page') -> None:
         """Export pages with multithreading support.
@@ -516,6 +584,7 @@ class ConfluenceExporter:
             'statistics': {
                 'pages_exported': self.export_stats['pages_exported'],
                 'folders_exported': self.export_stats['folders_exported'],
+                'databases_exported': self.export_stats['databases_exported'],
                 'attachments_exported': self.export_stats['attachments_exported'],
                 'comments_exported': self.export_stats['comments_exported'],
                 'total_errors': len(self.export_stats['errors'])
@@ -577,6 +646,7 @@ class ConfluenceExporter:
         <ul>
             <li><strong>Pages Exported:</strong> {summary['statistics']['pages_exported']}</li>
             <li><strong>Folders Exported:</strong> {summary['statistics']['folders_exported']}</li>
+            <li><strong>Database Stubs Exported:</strong> {summary['statistics'].get('databases_exported', 0)} (structure only — data not exported)</li>
             <li><strong>Attachments Exported:</strong> {summary['statistics']['attachments_exported']}</li>
             <li><strong>Comments Exported:</strong> {summary['statistics']['comments_exported']}</li>
             <li class="{'error' if summary['statistics']['total_errors'] > 0 else 'success'}">

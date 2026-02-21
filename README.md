@@ -2,6 +2,8 @@
 
 A comprehensive Python tool for exporting and importing Confluence spaces using the Confluence REST API. This tool is designed to be robust, user-friendly, and cross-platform compatible.
 
+## Upated February 21, 2026 - Now supports folders!
+
 > [!WARNING]
 > ### Use of AI Disclaimer
 > Portions of this project were generated, corrected, or refined with the assistance of Artificial Intelligence (AI) tools.
@@ -449,6 +451,8 @@ exports/
     ├── blogposts/                   # Blog posts (if any)
     ├── folders/                     # Folders (Cloud only)
     │   └── folders_metadata.json    # Folder structure and metadata
+    ├── databases/                   # Database stubs (Cloud only)
+    │   └── databases_metadata.json  # Database structure (titles/hierarchy only — data not exported)
     └── metadata/
         └── space_info.json          # Space metadata
 ```
@@ -476,6 +480,25 @@ exports/
 - Reduce `general.max_workers` for slower connections
 - Export/import in smaller batches if possible
 - Use `--verbose` flag to monitor progress
+
+**5. Pages Temporarily Appear at Space Root During Import (Cloud)**
+
+When importing spaces that use Confluence folders (Cloud only), pages belonging to those folders may appear at the space root while the import is in progress. This is **expected behaviour**, not an error:
+
+- Folders whose parent is a page cannot be created until that parent page has been imported.
+- The tool imports all pages first, then creates the folders, then automatically moves pages into their correct folder locations.
+- A notice is logged at the start of page import to confirm this will happen.
+- No manual intervention is required — all pages will be in their correct locations once the import finishes.
+
+**6. Import Runs Significantly Longer Than Expected**
+
+For spaces with many folder-parented pages, the tool performs an additional sweep after folder creation to move each page into its correct folder (one API call per folder-parented page). This is proportional to the number of such pages and can add considerable time for large spaces.
+
+If the slow-down is caused by API rate limiting rather than the move sweep, the tool does not yet surface HTTP 429 responses clearly — they may appear as generic warnings or timeouts in verbose output. A dedicated rate-limit notification feature is planned for a future release. In the meantime:
+
+- Enable verbose logging (`--verbose`) and watch for repeated connection warnings or slow API responses.
+- Reduce `general.max_workers` in your configuration to lower the request rate.
+- Consider importing during off-peak hours.
 
 ### Error Logs
 
@@ -526,7 +549,8 @@ Due to limitations in the Confluence REST API, certain content types and feature
 
 | Content Type | Limitation | Notes |
 |-------------|------------|-------|
-| **Databases** | Not supported | Confluence databases (formerly known as "Database" macro or table-based databases) cannot be exported via the REST API. The API does not provide access to database schema or data. |
+| **Databases (structure)** | Partial — Cloud only | Database containers are recreated as empty stubs during import, preserving sidebar hierarchy. Pages that were children of databases are correctly moved under them using the v1 move endpoint. |
+| **Databases (data)** | Not supported | Database content (rows, columns, data) cannot be exported via the REST API. Data must be re-entered manually in the Confluence UI after import. |
 | **Analytics data** | Not supported | Page view statistics, user analytics, and other telemetry data are not available via the API. |
 | **Space permissions** | Partial | Space permissions are not exported. Permissions must be manually configured on the target space. |
 | **Page restrictions** | Metadata only | Page restrictions are captured in metadata but not automatically applied during import. |
@@ -538,23 +562,26 @@ Folders in Confluence have specific API limitations that affect export and impor
 
 - **Cloud Only**: Folders are only available in Confluence Cloud via the v2 API. Server and Data Center instances do not support folders via API.
 - **API Support**: Some Confluence Cloud instances may not have full v2 API support for folders. If folder export fails, the tool will continue exporting pages and other content.
-- **Parent References**: When pages are organized under folders, the folder acts as a parent. If folders cannot be recreated during import (due to API limitations or target environment differences), pages may appear as orphaned.
+- **Page Placement**: The Confluence v1 and v2 APIs cannot directly create pages as children of folders (the v1 `ancestors` field and v2 `parentId` both fail for folder targets). The tool works around this by creating pages at their default position and then moving them into the correct folder using the v1 move endpoint (`PUT /rest/api/content/{id}/move/append/{folderId}`). This is the confirmed community workaround (as of 2024) and correctly places pages inside folders in the sidebar.
+- **Fallback**: If the move call fails (e.g. on a Server/DC instance or due to permissions), a warning is logged and the page remains at its default position rather than causing the import to fail.
 
 ### Import/Restore Behavior
 
 When importing or restoring data, be aware of the following behaviors:
 
 #### Orphaned Pages
-If a page's parent (whether a page or folder) cannot be found during import:
+If a page's parent (whether a page, folder, or database) cannot be found during import:
 1. The tool attempts multiple passes to import pages in the correct hierarchy order
-2. If a parent still cannot be found, the tool creates a **synthetic parent page** titled `[Recovered] <Original Parent Name>`
-3. The synthetic page contains a list of child pages that were grouped under it
-4. You can manually reorganize these pages after import
+2. For pages under **folders**: folders are recreated and pages are moved into them using the v1 move endpoint (Cloud only)
+3. For pages under **databases**: empty database stubs are recreated and pages are moved into them (Cloud only; database data must be re-entered manually)
+4. If a parent still cannot be found after all passes, the tool creates a **synthetic parent page** titled `[Recovered] <Original Parent Name>`
+5. The synthetic page contains a list of child pages that were grouped under it
+6. You can manually reorganize these pages after import
 
 #### Synthetic Parent Pages
 Synthetic parent pages are created when:
 - The original parent page was not included in the export
-- The original parent was a folder that could not be recreated
+- The original parent was a folder or database that could not be recreated (e.g. on Server/DC instances where the v2 API is unavailable)
 - The parent page failed to import due to an error
 
 These placeholder pages can be identified by their `[Recovered]` prefix and can be safely deleted or replaced with actual content after organizing the child pages.
@@ -644,7 +671,8 @@ This project is licensed under the Apache 2.0 license - see the LICENSE and NOTI
 
 ## 🔄 Version History
 
-- **1.0.0**: Initial release with full export/import functionality
+- **1.1.0**: Fixed a bug where pages with folder-based parents were skipped during import when all folders in a space had page-based parents (resulting in an empty folder map at page-import time). Pages are now imported to a temporary location and automatically moved into their correct folders after the deferred folder phase completes. Verbose WARNING noise for expected folder-parent lookups during import has been suppressed. Added user-facing notice when temporary root placement will occur.
+- **1.0.0**: Initial release with full export/import functionality, folder and database stub support (Cloud), space key remapping, `clean-space` command, and multi-environment import/export.
 
 ---
 

@@ -33,11 +33,21 @@ class ConfluenceAPIClient:
         self.max_retries = max_retries
         self.rate_limit = rate_limit
         self._last_request_time = 0
-        
+
         # Detect if this is a Confluence Cloud instance (atlassian.net domain)
         # Cloud instances require /wiki/rest/api/ path, while Server/Data Center use /rest/api/
         self.is_cloud = 'atlassian.net' in self.base_url.lower()
         self.api_path = '/wiki/rest/api/' if self.is_cloud else '/rest/api/'
+
+        # Normalise base_url: if the user included '/wiki' at the end of their URL,
+        # strip it — the tool appends '/wiki/rest/api/' automatically for Cloud instances,
+        # so leaving it in produces double-/wiki paths that cause 404s.
+        if self.base_url.lower().endswith('/wiki'):
+            self.base_url = self.base_url[:-5]
+            logger.warning(
+                "Removed trailing '/wiki' from base_url — it is added automatically. "
+                f"Using: {self.base_url}"
+            )
         
         # Set up authentication
         if auth_token:
@@ -155,17 +165,76 @@ class ConfluenceAPIClient:
     
     def test_connection(self) -> bool:
         """Test the connection to Confluence.
-        
+
+        Makes a single fast request against each possible API path and stops as
+        soon as one succeeds.  Always tries both paths regardless of the
+        auto-detected is_cloud value, so the tool self-heals for:
+
+          - base_url already containing /wiki  (stripped in __init__)
+          - is_cloud mis-detected (proxy / custom domain redirect)
+          - Confluence Cloud redirecting /wiki/rest/api/ to /rest/api/
+
+        On success updates self.is_cloud and self.api_path in-place so all
+        subsequent requests in this session use the correct path.
+
         Returns:
             True if connection is successful, False otherwise
         """
-        try:
-            response = self._make_request('GET', 'space')
-            logger.info("Successfully connected to Confluence")
-            return True
-        except Exception as e:
-            logger.error(f"Connection test failed: {e}")
-            return False
+        # Always start with the configured path so fast-path succeeds when correct.
+        if self.is_cloud:
+            paths_to_try = [('/wiki/rest/api/', True), ('/rest/api/', False)]
+        else:
+            paths_to_try = [('/rest/api/', False), ('/wiki/rest/api/', True)]
+
+        # Use user/current as the probe endpoint: lightweight, auth-aware (returns
+        # 401 for bad credentials rather than 404), present on all Confluence Cloud
+        # and Server/DC versions, and does not trigger SSO redirects.
+        # serverInfo was the original choice but is deprecated on newer Cloud tenants.
+        probe_endpoint = 'user/current'
+
+        for api_path, is_cloud in paths_to_try:
+            url = urljoin(f"{self.base_url}{api_path}", probe_endpoint)
+            try:
+                self._rate_limit()
+                logger.debug(f"Testing connection: GET {url}")
+                response = self.session.get(url, timeout=self.timeout)
+                response.raise_for_status()
+
+                if api_path != self.api_path:
+                    logger.warning(
+                        f"Auto-corrected API path to '{api_path}' "
+                        f"(was '{self.api_path}'). "
+                        f"Tip: set base_url in config.yaml to the plain "
+                        f"atlassian.net URL with no trailing /wiki path."
+                    )
+                self.is_cloud = is_cloud
+                self.api_path = api_path
+                logger.info(
+                    f"Successfully connected to Confluence "
+                    f"({'Cloud' if is_cloud else 'Server/DC'} mode, "
+                    f"api_path: {api_path})"
+                )
+                return True
+
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status == 404:
+                    logger.warning(f"Got 404 on {url} — trying alternative API path...")
+                    continue
+                # Auth / permission errors — wrong credentials, not a path issue
+                logger.error(f"Connection test failed: {e}")
+                return False
+
+            except Exception as e:
+                logger.error(f"Connection test failed: {e}")
+                return False
+
+        logger.error(
+            f"Connection test failed: {probe_endpoint} returned 404 on both "
+            "/wiki/rest/api/ and /rest/api/. "
+            "Check that base_url is correct and that your Confluence instance is accessible."
+        )
+        return False
     
     def get_spaces(self, limit: int = 50, start: int = 0) -> List[Dict[str, Any]]:
         """Get list of Confluence spaces.
@@ -590,12 +659,44 @@ class ConfluenceAPIClient:
             return True
         except Exception as e:
             logger.error(f"Failed to delete page {page_id}: {e}")
+
+    def delete_folder(self, folder_id: str) -> bool:
+        """Delete a folder via the v2 API.
+
+        Args:
+            folder_id: Folder ID to delete
+
+        Returns:
+            True if deletion was successful (including already-deleted 404)
+
+        Raises:
+            requests.exceptions.RequestException: On request failure (except 404)
+        """
+        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+        v2_url = urljoin(self.base_url, v2_api_path)
+        endpoint_url = urljoin(v2_url, f'folders/{folder_id}')
+
+        try:
+            self._rate_limit()
+            response = self.session.delete(endpoint_url, timeout=self.timeout)
+            if response.status_code == 404:
+                logger.debug(f"Folder {folder_id} not found (already deleted)")
+                return True
+            response.raise_for_status()
+            logger.info(f"Deleted folder with ID: {folder_id}")
+            return True
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return True  # Already gone — treat as success
+            logger.error(f"Failed to delete folder {folder_id}: {e}")
+            raise
+
     def get_space_id(self, space_key: str) -> Optional[str]:
         """Get space ID from space key.
-        
+
         Args:
             space_key: Space key
-        
+
         Returns:
             Space ID or None if not found
         """
@@ -605,101 +706,341 @@ class ConfluenceAPIClient:
         except Exception as e:
             logger.warning(f"Could not get space ID for {space_key}: {e}")
             return None
-    
-    def get_folders(self, space_id: str) -> List[Dict[str, Any]]:
-        """Get folders in a space using v2 API.
-        
+
+    def get_space_id_v2(self, space_key: str) -> Optional[str]:
+        """Get the v2-format space ID for use with the Confluence v2 API.
+
+        The v1 REST API returns a legacy integer space ID (e.g. 131309).
+        The v2 REST API (folders, databases, etc.) requires the v2 space ID
+        which is retrieved from GET /wiki/api/v2/spaces?keys={space_key}.
+        These IDs are often different; passing the v1 ID to v2 endpoints
+        causes a 500 Internal Server Error from Atlassian.
+
         Args:
-            space_id: Space ID (not space key)
-        
+            space_key: Space key (e.g. 'KB')
+
         Returns:
-            List of folder dictionaries
-        
-        Raises:
-            requests.exceptions.RequestException: On request failure
-        
-        Notes:
-            Folders are only available in Confluence Cloud via the v2 API.
-            The endpoint is /wiki/api/v2/folders with spaceId parameter.
+            v2 space ID string, or None if not available
         """
-        # For v2 API, we need to use a different base path
-        # Construct the v2 API URL directly
-        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
-        v2_url = urljoin(self.base_url, v2_api_path)
-        
-        endpoint_url = urljoin(v2_url, 'folders')
-        
-        params = {
-            'spaceId': space_id,  # v2 API uses camelCase for parameters
-            'limit': 250  # Maximum allowed by API
-        }
-        
-        all_folders = []
+        try:
+            v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+            url = urljoin(self.base_url, f"{v2_api_path}spaces")
+            self._rate_limit()
+            response = self.session.get(
+                url,
+                params={'keys': space_key, 'limit': 1},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            results = response.json().get('results', [])
+            if results:
+                v2_id = str(results[0].get('id', ''))
+                logger.info(f"v2 space ID for '{space_key}': {v2_id}")
+                return v2_id
+            logger.warning(f"v2 spaces API returned no results for key '{space_key}'")
+        except Exception as e:
+            logger.warning(f"Could not get v2 space ID for {space_key}: {e}")
+        return None
+
+    def get_folders(self, space_id: str, space_key: str = None) -> List[Dict[str, Any]]:
+        """Discover folders in a space via v2 page-parent relationships.
+
+        The GET /wiki/api/v2/folders?space-id={id} endpoint returns 500 on
+        many Confluence Cloud tenants regardless of the space ID format.
+        This method uses a discovery approach instead:
+
+          1. Fetch all pages in the space via GET /wiki/api/v2/pages?space-id={id}.
+             Each page carries parentId and parentType fields.
+          2. Collect the parentId of every page whose parentType is "folder".
+          3. Fetch each discovered folder via GET /wiki/api/v2/folders/{id}.
+          4. Walk up: if a folder's own parentType is "folder", enqueue its
+             parentId so ancestor folders are also captured.
+
+        As a side-effect, populates self._v2_page_parents with a mapping of
+        {page_id -> {"parentId": ..., "parentType": ...}} so the exporter can
+        save this alongside page metadata for use during import.
+
+        Args:
+            space_id: Space ID
+
+        Returns:
+            List of folder dicts (id, title, parentId, parentType, …)
+        """
+        from urllib.parse import urlparse, parse_qs
+
+        v2_base = self.base_url + ('/wiki/api/v2/' if self.is_cloud else '/api/v2/')
+
+        # ------------------------------------------------------------------ #
+        # Step 1: page pass — collect v2 parent info and seed folder ID set   #
+        # ------------------------------------------------------------------ #
+        self._v2_page_parents: Dict[str, Any] = {}
+        folder_ids: set = set()
         cursor = None
-        
+
         try:
             while True:
+                params: Dict[str, Any] = {'space-id': space_id, 'limit': 250}
                 if cursor:
                     params['cursor'] = cursor
-                
+
                 self._rate_limit()
-                logger.debug(f"Getting folders from {endpoint_url} with params {params}")
-                
                 response = self.session.get(
-                    endpoint_url,
-                    params=params,
-                    timeout=self.timeout
+                    v2_base + 'pages', params=params, timeout=self.timeout
                 )
                 response.raise_for_status()
-                
                 data = response.json()
-                results = data.get('results', [])
-                all_folders.extend(results)
-                
-                # Check for next page - v2 API may return cursor in _links
-                links = data.get('_links', {})
-                next_link = links.get('next')
-                
+
+                for page in data.get('results', []):
+                    pid = str(page.get('id', ''))
+                    parent_id = str(page.get('parentId', '')) if page.get('parentId') else None
+                    parent_type = page.get('parentType')
+                    self._v2_page_parents[pid] = {
+                        'parentId': parent_id,
+                        'parentType': parent_type,
+                    }
+                    if parent_type == 'folder' and parent_id:
+                        folder_ids.add(parent_id)
+
+                next_link = data.get('_links', {}).get('next')
                 if not next_link:
                     break
-                
-                # If next_link is a full URL, extract cursor from it
-                # If it's just a cursor string, use it directly
-                if isinstance(next_link, str):
-                    if '?' in next_link:
-                        # Extract cursor from query string
-                        from urllib.parse import urlparse, parse_qs
-                        parsed = urlparse(next_link)
-                        query_params = parse_qs(parsed.query)
-                        cursor = query_params.get('cursor', [None])[0]
-                    else:
-                        cursor = next_link
+                if isinstance(next_link, str) and '?' in next_link:
+                    parsed = urlparse(next_link)
+                    cursor = parse_qs(parsed.query).get('cursor', [None])[0]
                 else:
-                    break
-                
+                    cursor = next_link if isinstance(next_link, str) else None
                 if not cursor:
                     break
-                
-                logger.debug(f"Retrieved {len(all_folders)} folders so far...")
-            
-            logger.info(f"Retrieved {len(all_folders)} total folders from space {space_id}")
-            return all_folders
-            
+
         except requests.exceptions.HTTPError as e:
-            # Folders may not be available (Server/DC or old Cloud instances)
-            if e.response.status_code == 404:
-                logger.info(f"Folders API not available (likely Server/DC instance or old Cloud): {e}")
-                return []
-            # Handle 500 errors gracefully - may indicate folder API not fully supported
-            elif e.response.status_code == 500:
-                logger.info(f"Folders API returned server error (may not be enabled or supported): {e}")
-                return []
-            raise
-        except Exception as e:
-            logger.warning(f"Error retrieving folders: {e}")
+            status = e.response.status_code if e.response is not None else None
+            if status in (404, 405):
+                logger.info("v2 pages API not available; cannot discover folders")
+            else:
+                logger.warning(f"Error fetching pages for folder discovery (HTTP {status}): {e}")
             return []
+        except Exception as e:
+            logger.warning(f"Error fetching pages for folder discovery: {e}")
+            return []
+
+        if not folder_ids:
+            logger.info(
+                "No pages with folder parents found in space — "
+                "trying direct folder API fallback (BFS from space root)"
+            )
+            return self._get_folders_by_bfs(space_id, v2_base, space_key=space_key)
+
+        logger.info(
+            f"Found {len(folder_ids)} unique folder parent(s) across "
+            f"{len(self._v2_page_parents)} pages; fetching folder details…"
+        )
+
+        # ------------------------------------------------------------------ #
+        # Step 2: fetch each folder, recursively walk up to ancestor folders  #
+        # ------------------------------------------------------------------ #
+        all_folders: Dict[str, Any] = {}
+        queue = list(folder_ids)
+
+        while queue:
+            folder_id = queue.pop(0)
+            if folder_id in all_folders:
+                continue
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    v2_base + f'folders/{folder_id}', timeout=self.timeout
+                )
+                if response.status_code == 200:
+                    folder = response.json()
+                    all_folders[folder_id] = folder
+                    # if this folder is itself inside another folder, enqueue the parent
+                    if folder.get('parentType') == 'folder' and folder.get('parentId'):
+                        parent_id = str(folder['parentId'])
+                        if parent_id not in all_folders:
+                            queue.append(parent_id)
+                else:
+                    logger.debug(
+                        f"Could not fetch folder {folder_id}: HTTP {response.status_code}"
+                    )
+            except Exception as e:
+                logger.debug(f"Error fetching folder {folder_id}: {e}")
+
+        logger.info(f"Discovered {len(all_folders)} folder(s) in space {space_id}")
+        return list(all_folders.values())
     
-    def create_folder(self, space_id: str, folder_name: str, 
+    def _get_folders_by_bfs(self, space_id: str, v2_base: str,
+                            space_key: str = None) -> List[Dict[str, Any]]:
+        """BFS fallback for get_folders when the space has no pages.
+
+        Tries four strategies in order, stopping at the first that yields results:
+
+          1. GET /wiki/api/v2/folders?space-id={id}   — returns all folders in one
+             shot (paginated). Returns 500 on some tenants; skipped if so.
+          2. GET /wiki/api/v2/folders?parentId={space_id} — root-level folders whose
+             parent is the space, then recursively GET …?parentId={folder_id}.
+          3. GET /wiki/api/v2/folders (no filter) — fetches all accessible folders,
+             filtered client-side by spaceId. Works when filter params cause 500.
+          4. v1 CQL search: GET /wiki/rest/api/content/search?cql=type="folder"
+             AND space.key="{space_key}". Requires space_key to be provided.
+
+        Args:
+            space_id:  v2 space ID
+            v2_base:   base URL for the v2 API (already constructed by caller)
+            space_key: optional space key, used by strategy 4
+
+        Returns:
+            List of folder dicts, or [] if all strategies are unavailable.
+        """
+        from urllib.parse import urlparse, parse_qs
+
+        def _paginate(params: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+            """Fetch all pages for the given params.
+
+            Returns:
+                List of folder dicts on success (may be empty),
+                None if the API returned a non-200 status or raised an exception.
+            """
+            results: List[Dict[str, Any]] = []
+            cursor = None
+            while True:
+                p = dict(params)
+                if cursor:
+                    p['cursor'] = cursor
+                try:
+                    self._rate_limit()
+                    resp = self.session.get(
+                        v2_base + 'folders', params=p, timeout=self.timeout
+                    )
+                    print(f"    [folder API] GET folders {p} → HTTP {resp.status_code}")
+                    if resp.status_code != 200:
+                        return None
+                    data = resp.json()
+                except Exception as exc:
+                    print(f"    [folder API] error for {p}: {exc}")
+                    return None
+
+                batch = data.get('results', [])
+                print(f"    [folder API] {len(batch)} result(s) in this page")
+                results.extend(batch)
+                next_link = data.get('_links', {}).get('next')
+                if not next_link:
+                    break
+                parsed = urlparse(next_link) if isinstance(next_link, str) else None
+                cursor = parse_qs(parsed.query).get('cursor', [None])[0] if parsed else None
+                if not cursor:
+                    break
+            return results
+
+        # ── Strategy 1: space-id filter (gets everything in one sweep) ────── #
+        print(f"  [folder discovery] strategy 1: space-id={space_id}")
+        by_space = _paginate({'space-id': space_id, 'limit': 250})
+        if by_space:
+            print(f"  [folder discovery] strategy 1 found {len(by_space)} folder(s)")
+            return by_space
+
+        # ── Strategy 2: BFS from space root via parentId ──────────────────── #
+        print(f"  [folder discovery] strategy 2: parentId BFS from space {space_id}")
+        all_folders: Dict[str, Any] = {}
+        queue: list = [space_id]
+
+        while queue:
+            parent_id = queue.pop(0)
+            page_results = _paginate({'parentId': parent_id, 'limit': 250})
+            for folder in (page_results or []):
+                fid = str(folder.get('id', ''))
+                if fid and fid not in all_folders:
+                    all_folders[fid] = folder
+                    queue.append(fid)
+
+        if all_folders:
+            print(f"  [folder discovery] strategy 2 found {len(all_folders)} folder(s)")
+            return list(all_folders.values())
+
+        # ── Strategy 3: no filter — list all accessible folders, filter here ─ #
+        # Some tenants return 500 for any filter param but serve the unfiltered
+        # endpoint fine.  We paginate everything and match by spaceId client-side.
+        print(
+            f"  [folder discovery] strategy 3: no-filter listing, "
+            f"client-side filter by spaceId={space_id}"
+        )
+        all_unfiltered = _paginate({'limit': 250})
+        if all_unfiltered is not None:
+            space_folders = [
+                f for f in all_unfiltered
+                if str(f.get('spaceId', '')) == space_id
+            ]
+            if space_folders:
+                print(
+                    f"  [folder discovery] strategy 3 found {len(space_folders)} folder(s) "
+                    f"(from {len(all_unfiltered)} total across all spaces)"
+                )
+                return space_folders
+            elif all_unfiltered:
+                print(
+                    f"  [folder discovery] strategy 3: {len(all_unfiltered)} total folders "
+                    f"accessible but none matched spaceId={space_id}"
+                )
+            else:
+                print("  [folder discovery] strategy 3: no folders accessible at all")
+
+        # ── Strategy 4: v1 CQL search for type=folder in this space ──────── #
+        if space_key:
+            print(
+                f"  [folder discovery] strategy 4: v1 CQL "
+                f'type="folder" AND space.key="{space_key}"'
+            )
+            v1_base = self.base_url + self.api_path
+            cql = f'type="folder" AND space.key="{space_key}"'
+            try:
+                self._rate_limit()
+                resp = self.session.get(
+                    v1_base + 'content/search',
+                    params={'cql': cql, 'limit': 250},
+                    timeout=self.timeout,
+                )
+                print(f"    [folder API v1 CQL] → HTTP {resp.status_code}")
+                if resp.status_code == 200:
+                    v1_results = resp.json().get('results', [])
+                    print(f"    [folder API v1 CQL] {len(v1_results)} result(s)")
+                    if v1_results:
+                        # Map v1 content objects to a v2-like shape so the
+                        # rest of the pipeline (delete_folder) can use them.
+                        folders_v1 = [
+                            {
+                                'id': str(r.get('id', '')),
+                                'title': r.get('title', ''),
+                                'spaceId': space_id,
+                            }
+                            for r in v1_results
+                            if r.get('id')
+                        ]
+                        print(
+                            f"  [folder discovery] strategy 4 found "
+                            f"{len(folders_v1)} folder(s) via v1 CQL"
+                        )
+                        return folders_v1
+                else:
+                    try:
+                        err_body = resp.text[:300]
+                    except Exception:
+                        err_body = ''
+                    print(
+                        f"    [folder API v1 CQL] failed: HTTP {resp.status_code} {err_body}"
+                    )
+            except Exception as exc:
+                print(f"    [folder API v1 CQL] error: {exc}")
+        else:
+            print(
+                "  [folder discovery] strategy 4 skipped (space_key not available)"
+            )
+
+        print(
+            f"  [folder discovery] all strategies returned 0 folders "
+            f"(space_id={space_id}, v2_base={v2_base})"
+        )
+        return []
+
+    def create_folder(self, space_id: str, folder_name: str,
                      parent_id: str = None) -> Dict[str, Any]:
         """Create a folder in a space using v2 API.
         
@@ -753,4 +1094,180 @@ class ConfluenceAPIClient:
                 logger.warning(f"Folders API not available (likely Server/DC instance or old Cloud): {e}")
                 raise
             logger.error(f"Failed to create folder '{folder_name}': {e}")
+            raise
+
+    def move_content(self, content_id: str, target_id: str,
+                     position: str = 'append') -> bool:
+        """Move content to be a child of (or sibling of) a target using the v1 move endpoint.
+
+        This is the confirmed workaround for placing pages under non-page content
+        types (folders, databases, whiteboards) where the create_page ancestors
+        parameter and the v2 API parentId field both fail with 500 errors.
+
+        Args:
+            content_id: ID of the content to move
+            target_id: ID of the target content (page, folder, database, etc.)
+            position: Relationship to target — 'append' (make child of target),
+                      'before' (sibling before target), 'after' (sibling after target)
+
+        Returns:
+            True if the move succeeded
+
+        Raises:
+            requests.exceptions.RequestException: On request failure
+
+        Notes:
+            Uses PUT /rest/api/content/{id}/move/{position}/{targetId}.
+            Despite the name, this endpoint works for moving content under any
+            target content type, not only pages.
+            Only available on Confluence Cloud (v2-era feature).
+        """
+        endpoint = f"content/{content_id}/move/{position}/{target_id}"
+        try:
+            self._rate_limit()
+            logger.debug(f"Moving content {content_id} to {position} {target_id}")
+            response = self._make_request('PUT', endpoint)
+            logger.info(f"Moved content {content_id} under target {target_id}")
+            return True
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                logger.warning(
+                    f"Move endpoint not available (likely Server/DC or content not found): {e}"
+                )
+            else:
+                logger.warning(
+                    f"Failed to move content {content_id} under {target_id} "
+                    f"(HTTP {status}): {e}"
+                )
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to move content {content_id} under {target_id}: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Database API (Confluence Cloud v2 only)
+    # ------------------------------------------------------------------
+
+    def get_databases(self, space_id: str) -> List[Dict[str, Any]]:
+        """Discover databases in a space via v2 page-parent relationships.
+
+        GET /wiki/api/v2/databases?space-id={id} returns 500 on Confluence
+        Cloud for the same reason as the folders endpoint.  Instead, reuse
+        the cached _v2_page_parents mapping (populated by get_folders()) to
+        find pages whose parentType is "database", then fetch each database
+        individually via GET /wiki/api/v2/databases/{id}.
+
+        If get_folders() has not been called first (no cache), falls back to
+        returning an empty list with an informational log message.
+
+        Args:
+            space_id: Space ID (not space key)
+
+        Returns:
+            List of database dicts (id, title, parentId, parentType, …)
+        """
+        v2_base = self.base_url + ('/wiki/api/v2/' if self.is_cloud else '/api/v2/')
+
+        # Reuse the page-parent data collected during get_folders().
+        # Databases are first-class content objects; pages inside a database
+        # have parentType == "database".
+        v2_page_parents = getattr(self, '_v2_page_parents', {})
+        if not v2_page_parents:
+            logger.info(
+                "No cached v2 page-parent data available for database discovery "
+                "(call get_folders() first). Skipping database export."
+            )
+            return []
+
+        database_ids: set = {
+            str(info['parentId'])
+            for info in v2_page_parents.values()
+            if info.get('parentType') == 'database' and info.get('parentId')
+        }
+
+        if not database_ids:
+            logger.info("No pages with database parents found in space — no databases to export")
+            return []
+
+        logger.info(
+            f"Found {len(database_ids)} unique database parent(s) across "
+            f"{len(v2_page_parents)} pages; fetching database details…"
+        )
+
+        all_databases: Dict[str, Any] = {}
+        for db_id in database_ids:
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    v2_base + f'databases/{db_id}', timeout=self.timeout
+                )
+                if response.status_code == 200:
+                    all_databases[db_id] = response.json()
+                else:
+                    logger.debug(
+                        f"Could not fetch database {db_id}: HTTP {response.status_code}"
+                    )
+            except Exception as e:
+                logger.debug(f"Error fetching database {db_id}: {e}")
+
+        logger.info(f"Discovered {len(all_databases)} database(s) in space {space_id}")
+        return list(all_databases.values())
+
+    def create_database(self, space_id: str, title: str,
+                        parent_id: str = None) -> Dict[str, Any]:
+        """Create an empty database stub in a space using the v2 API.
+
+        Creates the database container only.  Database content (rows, columns,
+        data) cannot be set via the REST API and must be re-entered manually
+        in the Confluence UI after import.
+
+        Args:
+            space_id: Space ID (not space key)
+            title: Database title
+            parent_id: Optional parent content ID (page or folder)
+
+        Returns:
+            Created database dictionary (contains at minimum 'id' and 'title')
+
+        Raises:
+            requests.exceptions.RequestException: On request failure
+
+        Notes:
+            Databases are only available in Confluence Cloud via the v2 API.
+            The endpoint is POST /wiki/api/v2/databases.
+        """
+        v2_api_path = '/wiki/api/v2/' if self.is_cloud else '/api/v2/'
+        v2_url = urljoin(self.base_url, v2_api_path)
+        endpoint_url = urljoin(v2_url, 'databases')
+
+        data: Dict[str, Any] = {
+            "spaceId": space_id,
+            "title": title
+        }
+        if parent_id:
+            data["parentId"] = parent_id
+
+        try:
+            self._rate_limit()
+            logger.debug(f"Creating database '{title}' in space {space_id}")
+
+            response = self.session.post(
+                endpoint_url,
+                json=data,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+
+            database = response.json()
+            logger.info(f"Created database stub: '{title}' (ID: {database.get('id')})")
+            return database
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                logger.warning(
+                    f"Databases API not available (likely Server/DC or old Cloud): {e}"
+                )
+            logger.error(f"Failed to create database '{title}': {e}")
             raise
