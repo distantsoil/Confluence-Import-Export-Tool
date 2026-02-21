@@ -17,8 +17,10 @@ Less than you think. I'm not an expert with Python by any means, so I got 70-80%
 
 ### Does your company use Confluence? and why am I pointing this out?
 Yes, the company I work for uses Confluence and so have past employers. Part of the motiviation for me writing this was a problem I saw emerging with multiple Confluence spaces that shared the same keys that might need to be consolidated. 
+
 However I did not **ever** connect to or test this tool with any of the company systems, or using company technology. This is strictly a personal initiative.
-As an IT professional, you should never use this tool without **explicit** authorization from your IT team and show them this page so they understand its capabilities. 
+
+You should never use this tool without **explicit** authorization from your IT team and show them this page so they understand its capabilities. 
 
 :coffee: **If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
 
