@@ -38,7 +38,7 @@ A comprehensive Python tool for exporting and importing Confluence spaces using 
 > - **Independently validate and review** for security, compliance, and fitness for purpose.
 > - No warranty or guarantee is provided regarding accuracy, safety, or reliability.
 
-> [!IMPORTANT]
+> [!CAUTION]
 > ### Security & Responsible Use Disclaimer
 > This tool is intended to help administrators **back up and restore Confluence spaces** (e.g., preparing a test environment or creating a migration copy).
 >
