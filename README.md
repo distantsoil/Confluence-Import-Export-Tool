@@ -22,7 +22,8 @@ However I did not **ever** connect to or test this tool with any of the company 
 
 You should never use this tool without **explicit** authorization from your IT team and show them this page so they understand its capabilities. 
 
-:coffee: **If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
+## :coffee: 
+**If you like this project, or found it (or my efforts) useful, I'd appreciate your support by [buying me a coffee](https://ko-fi.com/distantsoil)**
 
 > [!WARNING]
 > ### Use of AI Disclaimer
