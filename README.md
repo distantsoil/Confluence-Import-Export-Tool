@@ -479,6 +479,25 @@ exports/
 - Export/import in smaller batches if possible
 - Use `--verbose` flag to monitor progress
 
+**5. Pages Temporarily Appear at Space Root During Import (Cloud)**
+
+When importing spaces that use Confluence folders (Cloud only), pages belonging to those folders may appear at the space root while the import is in progress. This is **expected behaviour**, not an error:
+
+- Folders whose parent is a page cannot be created until that parent page has been imported.
+- The tool imports all pages first, then creates the folders, then automatically moves pages into their correct folder locations.
+- A notice is logged at the start of page import to confirm this will happen.
+- No manual intervention is required — all pages will be in their correct locations once the import finishes.
+
+**6. Import Runs Significantly Longer Than Expected**
+
+For spaces with many folder-parented pages, the tool performs an additional sweep after folder creation to move each page into its correct folder (one API call per folder-parented page). This is proportional to the number of such pages and can add considerable time for large spaces.
+
+If the slow-down is caused by API rate limiting rather than the move sweep, the tool does not yet surface HTTP 429 responses clearly — they may appear as generic warnings or timeouts in verbose output. A dedicated rate-limit notification feature is planned for a future release. In the meantime:
+
+- Enable verbose logging (`--verbose`) and watch for repeated connection warnings or slow API responses.
+- Reduce `general.max_workers` in your configuration to lower the request rate.
+- Consider importing during off-peak hours.
+
 ### Error Logs
 
 The tool provides detailed error logging. Enable verbose mode for debugging:
@@ -650,7 +669,8 @@ This project is licensed under the Apache 2.0 license - see the LICENSE and NOTI
 
 ## 🔄 Version History
 
-- **1.0.0**: Initial release with full export/import functionality
+- **1.1.0**: Fixed a bug where pages with folder-based parents were skipped during import when all folders in a space had page-based parents (resulting in an empty folder map at page-import time). Pages are now imported to a temporary location and automatically moved into their correct folders after the deferred folder phase completes. Verbose WARNING noise for expected folder-parent lookups during import has been suppressed. Added user-facing notice when temporary root placement will occur.
+- **1.0.0**: Initial release with full export/import functionality, folder and database stub support (Cloud), space key remapping, `clean-space` command, and multi-environment import/export.
 
 ---
 

@@ -10,7 +10,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="confluence-export-import-tool",
-    version="1.0.0",
+    version="1.1.0",
     author="Confluence Tools",
     description="A robust tool to export and import Confluence spaces via REST API",
     long_description=long_description,

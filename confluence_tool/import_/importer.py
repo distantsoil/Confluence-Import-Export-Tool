@@ -723,7 +723,19 @@ class ConfluenceImporter:
                 return
             
             logger.info(f"Found {len(page_files)} {content_type}s to import")
-            
+
+            # Notify the user that pages with folder parents will appear at the
+            # space root temporarily while folders are being created.
+            deferred_folder_count = len(getattr(self, '_deferred_folders', []))
+            if deferred_folder_count > 0 or self._known_folder_ids:
+                logger.info(
+                    "NOTE: This space contains folders whose parent pages must be "
+                    "imported before the folders can be created. Pages belonging to "
+                    "those folders will appear at the space root temporarily during "
+                    "import. They will be moved into their correct folders automatically "
+                    "once all pages and folders have been processed — no action required."
+                )
+
             # Load page metadata for all pages
             pages_metadata = self._load_pages_metadata(pages_dir, page_files)
             
@@ -1522,8 +1534,19 @@ This placeholder was created to preserve the organizational structure of the fol
                 self.page_mapping[old_parent_id] = existing_parent['id']
                 return existing_parent['id']
 
-        # Parent not found, return None (page will be created as root page)
-        logger.warning(f"Parent page not found for ancestors: {ancestors}")
+        # Parent not found, return None (page will be created as root page).
+        # If the missing parent is a known export folder, this is intentional —
+        # the folder hasn't been created yet and the page will be moved into it
+        # by _move_pages_to_deferred_folders() after folder import completes.
+        # Log at DEBUG to avoid alarming the user with expected warnings.
+        if old_parent_id and old_parent_id in self._known_folder_ids:
+            logger.debug(
+                f"Parent {old_parent_id} ({parent_info.get('title', '?')}) is a "
+                f"deferred folder — page will be placed at root temporarily and "
+                f"moved into the folder after _import_deferred_folders() completes"
+            )
+        else:
+            logger.warning(f"Parent page not found for ancestors: {ancestors}")
         return None
     
     def _should_update_page(self, source_metadata: Dict[str, Any], 
