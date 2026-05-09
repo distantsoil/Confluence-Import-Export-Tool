@@ -23,6 +23,7 @@ from .api.client import ConfluenceAPIClient
 from .export.exporter import ConfluenceExporter
 from .import_.importer import ConfluenceImporter
 from .sync.synchronizer import ConfluenceSynchronizer
+from . import profiles as profiles_mod
 from .utils.helpers import (
     setup_logging, display_spaces_table, prompt_space_selection,
     get_platform_info, validate_confluence_url, prompt_target_config_setup,
@@ -60,9 +61,39 @@ def print_platform_info():
     print_colored(f"Python: {info['python_version']}", 'YELLOW')
 
 
+def _load_profile_config(profile_name: str) -> ConfigManager:
+    """Load a saved profile and return it as a ConfigManager."""
+    try:
+        data = profiles_mod.load(profile_name)
+    except FileNotFoundError as e:
+        print_colored(str(e), 'RED')
+        existing = profiles_mod.list_profiles()
+        if existing:
+            print_colored("Available profiles: " + ", ".join(existing), 'YELLOW')
+        else:
+            print_colored(
+                "No profiles saved yet. Create one with: confluence-tool wizard",
+                'YELLOW',
+            )
+        sys.exit(1)
+    return ConfigManager.from_dict(data['config'], source=f"profile:{profile_name}")
+
+
 def init_config(ctx):
     """Initialize configuration when needed."""
     if 'config' not in ctx.obj:
+        # Profile takes precedence over file-based config when set on the group.
+        profile_name = ctx.obj.get('profile')
+        if profile_name:
+            ctx.obj['config'] = _load_profile_config(profile_name)
+            log_config = ctx.obj['config'].get_logging_config()
+            log_level = 'DEBUG' if ctx.obj.get('verbose') else log_config.get('level', 'INFO')
+            setup_logging(
+                log_level=log_level,
+                log_file=log_config.get('file'),
+                log_format=log_config.get('format'),
+            )
+            return
         try:
             config_manager = ConfigManager(ctx.obj.get('config_path'))
             ctx.obj['config'] = config_manager
@@ -89,20 +120,45 @@ def init_config(ctx):
             sys.exit(1)
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option('--config', '-c', help='Path to configuration file')
+@click.option('--profile', '-p', help='Use a saved profile from ~/.confluence-tool/profiles/')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
+@click.option('--reset', is_flag=True, help='Remove all tool state in ~/.confluence-tool/ and exit')
 @click.pass_context
-def cli(ctx, config, verbose):
-    """Confluence Export-Import Tool - Export and import Confluence spaces via REST API."""
+def cli(ctx, config, profile, verbose, reset):
+    """Confluence Export-Import Tool - Export and import Confluence spaces via REST API.
+
+    Tip: run `confluence-tool wizard` for an interactive, prompt-driven flow.
+    """
+    if reset:
+        removed = profiles_mod.reset_tool_state()
+        if removed:
+            print_colored(f"Removed {len(removed)} item(s) from {profiles_mod.state_root()}:", 'YELLOW')
+            for p in removed:
+                print(f"  - {p}")
+        else:
+            print_colored(f"No state to remove at {profiles_mod.state_root()}.", 'GREEN')
+        sys.exit(0)
+
     print_banner()
-    
+
     # Ensure that ctx.obj exists and is a dict
     ctx.ensure_object(dict)
-    
-    # Store config path and verbose flag for later use
+
+    # Store config path / profile / verbose flag for later use
     ctx.obj['config_path'] = config
+    ctx.obj['profile'] = profile
     ctx.obj['verbose'] = verbose
+
+    # If invoked with no subcommand, point users at the wizard.
+    if ctx.invoked_subcommand is None:
+        print_colored(
+            "No subcommand given. Run `confluence-tool wizard` for the interactive flow,",
+            'CYAN',
+        )
+        print_colored("or `confluence-tool --help` to see all commands.", 'CYAN')
+        sys.exit(0)
 
 
 @cli.group()
@@ -1052,6 +1108,16 @@ def help_guide():
 
 {Fore.GREEN if COLORS_AVAILABLE else ''}🚀 Getting Started:{Style.RESET_ALL if COLORS_AVAILABLE else ''}
 
+{Fore.YELLOW if COLORS_AVAILABLE else ''}Easiest path — run the interactive wizard:{Style.RESET_ALL if COLORS_AVAILABLE else ''}
+   confluence-tool wizard
+
+   The wizard prompts for everything (URL, username, API token,
+   action, space) and saves named profiles under
+   ~/.confluence-tool/profiles/ so you can re-run with:
+   confluence-tool --profile <name> export --space KB
+
+{Fore.YELLOW if COLORS_AVAILABLE else ''}Or use a YAML config file (advanced):{Style.RESET_ALL if COLORS_AVAILABLE else ''}
+
 1. {Fore.YELLOW if COLORS_AVAILABLE else ''}Create Configuration File:{Style.RESET_ALL if COLORS_AVAILABLE else ''}
    confluence-tool config create
 
@@ -1448,7 +1514,74 @@ def compare(ctx, source_space, target_space, source_config, target_config, outpu
         sys.exit(1)
 
 
-# Make import command available as import to avoid Python keyword conflict  
+@cli.command()
+@click.pass_context
+def wizard(ctx):
+    """Interactive prompt-driven wizard (recommended for new users).
+
+    Walks through choosing/creating a connection profile and running an
+    action (export, import, sync, etc.) without remembering flags.
+    Profiles are saved at ~/.confluence-tool/profiles/<name>.json.
+    """
+    from . import wizard as wizard_mod
+    try:
+        wizard_mod.run(ctx)
+    except KeyboardInterrupt:
+        print_colored("\nWizard cancelled.", 'YELLOW')
+        sys.exit(0)
+
+
+@cli.group()
+def profile():
+    """Manage saved connection profiles."""
+    pass
+
+
+@profile.command('list')
+def profile_list():
+    """List all saved profiles."""
+    names = profiles_mod.list_profiles()
+    if not names:
+        print_colored(
+            f"No profiles saved at {profiles_mod.profiles_dir()}.", 'YELLOW'
+        )
+        print_colored("Create one with: confluence-tool wizard", 'YELLOW')
+        return
+    print_colored(f"Profiles in {profiles_mod.profiles_dir()}:", 'CYAN')
+    for n in names:
+        print(f"  - {profiles_mod.summary(n)}")
+
+
+@profile.command('show')
+@click.argument('name')
+def profile_show(name):
+    """Print a profile (API token redacted)."""
+    try:
+        data = profiles_mod.load(name)
+    except FileNotFoundError as e:
+        print_colored(str(e), 'RED')
+        sys.exit(1)
+    cfg = data.get('config', {})
+    auth = cfg.get('confluence', {}).get('auth', {})
+    if 'api_token' in auth and auth['api_token']:
+        auth['api_token'] = '***redacted***'
+    if 'password' in auth and auth['password']:
+        auth['password'] = '***redacted***'
+    print(json.dumps(data, indent=2))
+
+
+@profile.command('delete')
+@click.argument('name')
+@click.confirmation_option(prompt='Delete this profile?')
+def profile_delete(name):
+    """Delete a saved profile."""
+    if profiles_mod.delete(name):
+        print_colored(f"Deleted profile '{name}'.", 'GREEN')
+    else:
+        print_colored(f"Profile '{name}' not found.", 'YELLOW')
+
+
+# Make import command available as import to avoid Python keyword conflict
 cli.add_command(import_, 'import')
 
 
