@@ -4,7 +4,7 @@ import requests
 import logging
 import time
 from typing import Dict, List, Any, Optional, Union
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, urlsplit, urlunsplit, parse_qsl, urlencode
 import json
 
 logger = logging.getLogger(__name__)
@@ -373,23 +373,44 @@ class ConfluenceAPIClient:
             # For Cloud instances, prepend /wiki to the download path
             if self.is_cloud and not download_url.startswith('/wiki/'):
                 download_url = f"/wiki{download_url}"
-            
+
             # Prepend base_url
             full_url = f"{self.base_url}{download_url}"
         else:
             # It's already a full URL
             full_url = download_url
-        
+
+        # Strip the 'api=v2' query parameter Confluence Cloud sticks on
+        # _links.download URLs. That flag routes the request through a
+        # stricter media gateway that returns intermittent 401s on
+        # API-token + Basic auth flows. The legacy /wiki/download/attachments
+        # path itself still serves the file correctly.
+        parts = urlsplit(full_url)
+        if parts.query:
+            kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                    if k.lower() != 'api']
+            full_url = urlunsplit(parts._replace(query=urlencode(kept)))
+
+        # Per-request headers: the session defaults to Accept: application/json
+        # for REST calls, but /wiki/download/attachments/ serves binary content
+        # and that gateway returns 401 (not 406) when Accept conflicts.
+        headers = {'Accept': '*/*'}
+
         logger.debug(f"Downloading attachment from: {full_url}")
-        
+
         # Make the request with authentication and retry logic
         for attempt in range(self.max_retries + 1):
             try:
                 self._rate_limit()
-                
-                response = self.session.get(full_url, timeout=self.timeout, allow_redirects=True)
+
+                response = self.session.get(
+                    full_url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
                 response.raise_for_status()
-                
+
                 return response.content
                 
             except requests.exceptions.Timeout:
