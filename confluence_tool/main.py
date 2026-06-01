@@ -390,6 +390,14 @@ def export(ctx, space, output, source_config):
     except KeyboardInterrupt:
         print_colored("\nExport cancelled by user.", 'YELLOW')
         sys.exit(1)
+    except PermissionError as e:
+        # Raised by the attachment-download pre-flight. Show the (already
+        # human-readable) message without a stack trace; the underlying log
+        # lines already include the diagnostic detail.
+        print()
+        print_colored("Pre-flight check failed:", 'RED')
+        print_colored(str(e), 'YELLOW')
+        sys.exit(2)
     except Exception as e:
         print_colored(f"Export failed: {e}", 'RED')
         logger.exception("Export error details:")

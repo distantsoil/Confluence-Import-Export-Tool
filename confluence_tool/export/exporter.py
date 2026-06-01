@@ -55,7 +55,28 @@ class ConfluenceExporter:
         """
         logger.info(f"Starting export of space: {space_key}")
         self.export_stats['start_time'] = datetime.now()
-        
+
+        # Pre-flight: verify the token can actually download a binary, not just
+        # list attachment metadata. Catches scoped API tokens (which cannot
+        # download attachments) and similar misconfigurations early — before
+        # the user sees hundreds of identical 401 warnings mid-export.
+        preflight = self.client.preflight_attachment_download(space_key)
+        status = preflight['status']
+        if status == 'ok':
+            logger.info(f"Pre-flight OK — {preflight['detail']}")
+        elif status == 'forbidden':
+            logger.error("Pre-flight FAILED — attachments cannot be downloaded with this token.")
+            logger.error(preflight['detail'])
+            logger.error(preflight['hint'])
+            raise PermissionError(
+                "Attachment download pre-flight failed: " + preflight['detail']
+                + "\n\n" + preflight['hint']
+            )
+        elif status == 'no_attachments':
+            logger.info(f"Pre-flight skipped — {preflight['detail']}")
+        else:  # 'error'
+            logger.warning(f"Pre-flight inconclusive — {preflight['detail']}")
+
         try:
             # Create export directory structure
             export_dir = self._create_export_directory(space_key)

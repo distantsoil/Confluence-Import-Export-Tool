@@ -230,9 +230,19 @@ confluence:
 
 For Atlassian Cloud instances (e.g., yourcompany.atlassian.net):
 1. Go to [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
-2. Click "Create API token"
+2. Click **"Create API token"** — *not* "Create API token with scopes" (see warning below)
 3. Enter a label (e.g., "Confluence Tool")
 4. Copy the generated token to your config file
+
+> [!WARNING]
+> ## :rotating_light: Use a **classic** API token, not a scoped one
+> Atlassian recently introduced **scoped API tokens** ("Create API token with scopes") at the same page. **Scoped tokens cannot download attachments** — the metadata-listing endpoints work, but the binary-download endpoints return `401 Unauthorized; scope does not match`, regardless of which scopes you grant. This is a documented Atlassian limitation, not a tool bug.
+>
+> If you've already created a scoped token and exports/syncs are failing with 401s on every attachment, revoke it and create a **classic** (unscoped) token instead. The tool runs a pre-flight check on each export and will refuse to start with a clear message if the token can't download attachments.
+>
+> References:
+> - [Can't download confluence page attachments using API (HTTP 401)](https://community.developer.atlassian.com/t/cant-download-confluence-page-attachments-using-api-http-401/100789)
+> - [How do I download attachments from pages with scoped token](https://community.atlassian.com/forums/Confluence-questions/How-do-i-download-attachments-from-pages-with-scoped-token/qaq-p/3222385)
 
 **Note:** The tool automatically detects Confluence Cloud instances (*.atlassian.net) and uses the correct API endpoints. No additional configuration needed!
 

@@ -351,6 +351,129 @@ class ConfluenceAPIClient:
         
         return data.get('results', [])
     
+    def preflight_attachment_download(self, space_key: str) -> Dict[str, Any]:
+        """Smoke-test that the current credentials can actually download a binary.
+
+        Walks a few pages of the space looking for an attachment, then tries to
+        fetch its bytes. Returns a dict with:
+          - status: 'ok' | 'no_attachments' | 'forbidden' | 'error'
+          - detail: human-readable explanation
+          - hint:   suggested user action when status != 'ok'
+
+        Intended to be called once at the start of an export so users with token
+        types that can list metadata but not download binaries (notably the new
+        scoped API tokens) get a clear, single error instead of hundreds of 401s.
+        """
+        try:
+            # Fetch only the first page (50 results) — keeps the pre-flight fast.
+            content_iter = self.get_space_content(space_key, 'page', limit=50, start=0)
+        except Exception as exc:
+            return {
+                'status': 'error',
+                'detail': f"Could not list pages in space {space_key!r}: {exc}",
+                'hint': "Verify the space key and that the account has read access.",
+            }
+
+        scanned = 0
+        for page in content_iter:
+            scanned += 1
+            try:
+                attachments = self.get_page_attachments(page['id'])
+            except Exception:
+                continue
+            if not attachments:
+                continue
+
+            att = attachments[0]
+            att_id = att.get('id')
+            download_url = att.get('_links', {}).get('download')
+            if not download_url:
+                continue
+
+            try:
+                self.download_attachment(download_url, attachment_id=att_id)
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, 'status_code', None)
+                detail_text = (
+                    self._summarise_http_error(e.response)
+                    if e.response is not None else str(e)
+                )
+                if status in (401, 403):
+                    return {
+                        'status': 'forbidden',
+                        'detail': (
+                            f"Attachment download returned {status} for "
+                            f"{att.get('title', '?')!r} (id={att_id}) on page "
+                            f"{page.get('title', '?')!r}. {detail_text}"
+                        ),
+                        'hint': (
+                            "Your token is rejected by the attachment-download "
+                            "endpoint. Most common cause: a SCOPED API token "
+                            "(created at id.atlassian.com via 'Create API token "
+                            "with scopes') — these cannot download binary "
+                            "attachments, only metadata. Regenerate as a CLASSIC "
+                            "API token (the 'Create API token' button without "
+                            "'with scopes') and try again. If you're already on "
+                            "a classic token, this attachment may live on a "
+                            "page with view restrictions or in an archived/"
+                            "trashed location; export will continue and log the "
+                            "individual failures."
+                        ),
+                    }
+                return {
+                    'status': 'error',
+                    'detail': f"Attachment download failed with HTTP {status}: {detail_text}",
+                    'hint': "Re-run with --verbose for more context.",
+                }
+            except Exception as e:
+                return {
+                    'status': 'error',
+                    'detail': f"Attachment download raised {type(e).__name__}: {e}",
+                    'hint': "Re-run with --verbose for more context.",
+                }
+
+            return {
+                'status': 'ok',
+                'detail': (
+                    f"Verified: downloaded {att.get('title', '?')!r} "
+                    f"({len(attachments)} attachment(s) on page "
+                    f"{page.get('title', '?')!r})."
+                ),
+                'hint': '',
+            }
+
+        return {
+            'status': 'no_attachments',
+            'detail': (
+                f"Scanned {scanned} page(s) in {space_key!r} and found none "
+                "with attachments — download capability could not be verified."
+            ),
+            'hint': "This is informational only; the export will continue.",
+        }
+
+    @staticmethod
+    def _summarise_http_error(response: requests.Response) -> str:
+        """Extract the most useful diagnostic snippet from a Confluence error response.
+
+        Confluence returns either a JSON body with 'message'/'reason'/'code' or a
+        short HTML/text body. Truncate to keep log lines readable.
+        """
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            text = (response.text or '').strip().replace('\n', ' ')
+            return f"body[:200]={text[:200]!r}" if text else "(no body)"
+
+        # Common Confluence error fields
+        bits = []
+        for key in ('message', 'reason', 'code', 'errorMessages', 'errors',
+                    'title', 'detail', 'status-code'):
+            if key in payload and payload[key]:
+                bits.append(f"{key}={payload[key]!r}")
+        if not bits:
+            bits.append(f"json={str(payload)[:200]!r}")
+        return ", ".join(bits)
+
     def download_attachment(self, download_url: str,
                             attachment_id: Optional[str] = None) -> bytes:
         """Download attachment content.
@@ -422,6 +545,10 @@ class ConfluenceAPIClient:
                 # 401/403/404 won't be fixed by retrying — bail out so the
                 # caller can fall back to the legacy URL.
                 if status in (401, 403, 404):
+                    if e.response is not None:
+                        logger.debug(
+                            f"v2 download {status} → {self._summarise_http_error(e.response)}"
+                        )
                     raise
                 logger.warning(
                     f"v2 attachment download HTTP error {status} on "
@@ -493,7 +620,11 @@ class ConfluenceAPIClient:
                     raise
 
             except requests.exceptions.HTTPError as e:
-                logger.warning(f"Attachment download HTTP error {response.status_code} on attempt {attempt + 1}: {e}")
+                detail = self._summarise_http_error(response) if response is not None else "(no response)"
+                logger.warning(
+                    f"Attachment download HTTP error {response.status_code} on "
+                    f"attempt {attempt + 1}: {e} | {detail}"
+                )
                 logger.warning(f"  URL: {full_url}")
                 if attempt == self.max_retries:
                     raise
