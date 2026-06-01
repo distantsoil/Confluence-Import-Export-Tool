@@ -300,27 +300,46 @@ class ConfluenceExporter:
         content_dir = os.path.join(export_dir, f"{content_type}s")
         os.makedirs(content_dir, exist_ok=True)
         
+        from ..cancellation import is_cancelled, CancelledError as _Cancelled
+
         # Export pages with progress bar
         with tqdm(total=len(pages), desc=f"Exporting {content_type}s") as pbar:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 # Submit all page export tasks
                 future_to_page = {
-                    executor.submit(self._export_single_page, page, content_dir): page 
+                    executor.submit(self._export_single_page, page, content_dir): page
                     for page in pages
                 }
-                
-                # Process completed tasks
+
+                # Process completed tasks. Check the cancellation flag between
+                # futures so a Ctrl-C is observed without waiting for the full
+                # batch to drain.
                 for future in concurrent.futures.as_completed(future_to_page):
+                    if is_cancelled():
+                        logger.warning("Cancellation requested — stopping page export.")
+                        raise _Cancelled("Cancelled by user (Ctrl-C)")
+
                     page = future_to_page[future]
                     try:
                         future.result()
                         self.export_stats['pages_exported'] += 1
+                    except _Cancelled:
+                        raise
                     except Exception as e:
                         error_msg = f"Failed to export {content_type} '{page.get('title', 'Unknown')}': {e}"
                         logger.error(error_msg)
                         self.export_stats['errors'].append(error_msg)
                     finally:
                         pbar.update(1)
+            finally:
+                # cancel_futures was added in Python 3.9. Fall back gracefully
+                # on older interpreters — workers will still observe the
+                # cancellation flag via cancellable_sleep() and exit quickly.
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
     
     def _export_single_page(self, page: Dict[str, Any], content_dir: str) -> None:
         """Export a single page with all its components.

@@ -25,6 +25,7 @@ from .import_.importer import ConfluenceImporter
 from .sync.synchronizer import ConfluenceSynchronizer
 from . import profiles as profiles_mod
 from . import __version__ as PKG_VERSION
+from . import cancellation
 from .utils.helpers import (
     setup_logging, display_spaces_table, prompt_space_selection,
     get_platform_info, validate_confluence_url, prompt_target_config_setup,
@@ -154,6 +155,12 @@ def cli(ctx, config, profile, verbose, reset):
         sys.exit(0)
 
     print_banner()
+
+    # Install a two-stage Ctrl-C handler so long-running commands can be
+    # cancelled cleanly. First press: set a flag, finish the in-flight
+    # HTTP request, exit between pages with a tidy summary. Second press:
+    # hard-quit. Idempotent — safe even when the command is a no-op.
+    cancellation.install_handler()
 
     # Ensure that ctx.obj exists and is a dict
     ctx.ensure_object(dict)

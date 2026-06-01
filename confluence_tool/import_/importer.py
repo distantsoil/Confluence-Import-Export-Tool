@@ -14,6 +14,8 @@ import re
 from html.parser import HTMLParser
 import requests
 
+from ..cancellation import check_cancelled
+
 from ..api.client import ConfluenceAPIClient
 from ..utils.helpers import sanitize_filename
 from .content_rewriter import ContentRewriter
@@ -753,6 +755,7 @@ class ConfluenceImporter:
                 logger.debug(f"Root page titles: {[p.get('metadata', {}).get('title', p['filename']) for p in root_pages[:10]]}")
                 
                 for page_info in root_pages:
+                    check_cancelled()
                     try:
                         result_id = self._import_single_page(page_info, pages_dir, space_key, content_type)
                         old_id = page_info.get('metadata', {}).get('id')
@@ -786,6 +789,7 @@ class ConfluenceImporter:
                     skipped_in_pass = []
                     
                     for page_info in remaining_pages:
+                        check_cancelled()
                         # Check if parent is available
                         metadata = page_info.get('metadata', {})
                         parent_available = self._is_parent_available(metadata, space_key)
@@ -832,6 +836,7 @@ class ConfluenceImporter:
                         # Log detailed info about remaining pages and their missing parents
                         missing_parent_ids = set()
                         for page_info in remaining_pages:
+                            check_cancelled()
                             metadata = page_info.get('metadata', {})
                             ancestors = metadata.get('ancestors', [])
                             parent_info = ancestors[-1] if ancestors else {}
@@ -869,6 +874,7 @@ class ConfluenceImporter:
                         # Group orphaned pages by their missing parent ID
                         orphaned_by_parent = {}
                         for page_info in remaining_pages:
+                            check_cancelled()
                             metadata = page_info.get('metadata', {})
                             ancestors = metadata.get('ancestors', [])
                             if ancestors:
@@ -898,6 +904,7 @@ class ConfluenceImporter:
                             if parent_id == 'no_parent':
                                 # Import pages without ancestors directly as root pages
                                 for page_info in group_info['pages']:
+                                    check_cancelled()
                                     try:
                                         metadata = page_info.get('metadata', {})
                                         self._import_single_page(page_info, pages_dir, space_key, content_type)
@@ -955,6 +962,7 @@ This placeholder was created to preserve the organizational structure of the fol
                                 
                                 # Now import child pages under the synthetic parent (or as root if parent creation failed)
                                 for page_info in group_info['pages']:
+                                    check_cancelled()
                                     try:
                                         metadata = page_info.get('metadata', {})
                                         original_ancestors = metadata.get('ancestors', [])

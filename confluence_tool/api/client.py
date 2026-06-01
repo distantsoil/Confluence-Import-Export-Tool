@@ -7,6 +7,8 @@ from typing import Dict, List, Any, Optional, Union
 from urllib.parse import urljoin, quote, urlsplit, urlunsplit, parse_qsl, urlencode
 import json
 
+from ..cancellation import check_cancelled, cancellable_sleep
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,8 +76,8 @@ class ConfluenceAPIClient:
             
             if time_since_last < min_interval:
                 sleep_time = min_interval - time_since_last
-                time.sleep(sleep_time)
-        
+                cancellable_sleep(sleep_time)
+
         self._last_request_time = time.time()
     
     def _make_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
@@ -111,7 +113,7 @@ class ConfluenceAPIClient:
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
                     logger.warning(f"Rate limited. Waiting {retry_after} seconds...")
-                    time.sleep(retry_after)
+                    cancellable_sleep(retry_after)
                     continue
                 
                 # Check for authentication errors
@@ -159,8 +161,8 @@ class ConfluenceAPIClient:
             if attempt < self.max_retries:
                 wait_time = (2 ** attempt) * 1.0
                 logger.debug(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-        
+                cancellable_sleep(wait_time)
+
         raise requests.exceptions.RequestException("Max retries exceeded")
     
     def test_connection(self) -> bool:
@@ -562,7 +564,7 @@ class ConfluenceAPIClient:
                 if attempt == self.max_retries:
                     raise
             if attempt < self.max_retries:
-                time.sleep((2 ** attempt) * 1.0)
+                cancellable_sleep((2 ** attempt) * 1.0)
 
         raise requests.exceptions.RequestException(
             f"Max retries exceeded for v2 attachment download: {url}"
@@ -633,7 +635,7 @@ class ConfluenceAPIClient:
             if attempt < self.max_retries:
                 wait_time = (2 ** attempt) * 1.0
                 logger.debug(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
+                cancellable_sleep(wait_time)
 
         raise requests.exceptions.RequestException(f"Max retries exceeded for attachment download: {full_url}")
     
