@@ -61,6 +61,8 @@ A comprehensive Python tool for exporting and importing Confluence spaces using 
 - **Auto-Detection**: Automatically detects Confluence Cloud vs Server/Data Center and uses the correct API paths
 - **Cross-Platform**: Works on Windows, macOS, and Linux
 - **Beginner-Friendly**: Comprehensive documentation and guided setup for users new to APIs and Python
+- **Interactive Wizard**: `confluence-tool wizard` walks through profile setup and any action with arrow-key menus
+- **Saved Profiles**: Reuse Confluence connections via `--profile NAME` (stored in `~/.confluence-tool/profiles/`)
 - **Robust Error Handling**: Comprehensive error handling with detailed logging and progress tracking
 - **Flexible Configuration**: Central YAML configuration file with extensive customization options
 - **Interactive Selection**: Easy-to-use prompts for selecting spaces
@@ -167,6 +169,39 @@ If `confluence-tool` is not found, your Python scripts directory may not be in y
 - **[Troubleshooting Guide](TROUBLESHOOTING.md)** - Solutions to common problems
 - **Quick Start Script** - Run `python3 quickstart.py` (macOS/Linux) or `python quickstart.py` (Windows) for interactive setup
 
+## ✨ Interactive Wizard (Recommended)
+
+If you'd rather not memorise flags or hand-edit YAML, run the wizard:
+
+```bash
+confluence-tool wizard
+```
+
+The wizard walks you through:
+
+1. **Picking or creating a connection profile** — Confluence URL, username, API token; tested live before saving.
+2. **Choosing an action** — export, import, sync, compare, list spaces, or clean a space.
+3. **Filling in action-specific details** with arrow-key menus and sensible defaults.
+
+Profiles are saved as JSON files under `~/.confluence-tool/profiles/<name>.json` and are reusable across runs and shells. To use a saved profile from any command without the wizard:
+
+```bash
+confluence-tool --profile prod-cloud list-spaces
+confluence-tool --profile prod-cloud export --space KB
+confluence-tool --profile staging import ./exports/KB_20260101_120000
+```
+
+Profile management:
+
+```bash
+confluence-tool profile list        # show saved profiles
+confluence-tool profile show NAME   # print a profile (token redacted)
+confluence-tool profile delete NAME # remove a profile
+confluence-tool --reset             # wipe ~/.confluence-tool/ entirely
+```
+
+The wizard requires `rich` and `questionary` (in `requirements.txt`); if they aren't installed, it falls back to a plain text prompt flow. Existing flag-based commands (`export`, `import`, `sync`, etc.) continue to work unchanged.
+
 ## 🎯 Quick Start Guide
 
 ### Step 1: Create Configuration
@@ -195,9 +230,19 @@ confluence:
 
 For Atlassian Cloud instances (e.g., yourcompany.atlassian.net):
 1. Go to [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
-2. Click "Create API token"
+2. Click **"Create API token"** — *not* "Create API token with scopes" (see warning below)
 3. Enter a label (e.g., "Confluence Tool")
 4. Copy the generated token to your config file
+
+> [!WARNING]
+> ## :rotating_light: Use a **classic** API token, not a scoped one
+> Atlassian recently introduced **scoped API tokens** ("Create API token with scopes") at the same page. **Scoped tokens cannot download attachments** — the metadata-listing endpoints work, but the binary-download endpoints return `401 Unauthorized; scope does not match`, regardless of which scopes you grant. This is a documented Atlassian limitation, not a tool bug.
+>
+> If you've already created a scoped token and exports/syncs are failing with 401s on every attachment, revoke it and create a **classic** (unscoped) token instead. The tool runs a pre-flight check on each export and will refuse to start with a clear message if the token can't download attachments.
+>
+> References:
+> - [Can't download confluence page attachments using API (HTTP 401)](https://community.developer.atlassian.com/t/cant-download-confluence-page-attachments-using-api-http-401/100789)
+> - [How do I download attachments from pages with scoped token](https://community.atlassian.com/forums/Confluence-questions/How-do-i-download-attachments-from-pages-with-scoped-token/qaq-p/3222385)
 
 **Note:** The tool automatically detects Confluence Cloud instances (*.atlassian.net) and uses the correct API endpoints. No additional configuration needed!
 

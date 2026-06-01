@@ -23,7 +23,16 @@ class ConfigManager:
         self.config = self._load_config()
     
     @classmethod
-    def create_multi_env_manager(cls, source_config: Optional[str] = None, 
+    def from_dict(cls, config: Dict[str, Any], source: str = "<dict>") -> "ConfigManager":
+        """Build a ConfigManager from an in-memory dict (e.g. a saved profile)."""
+        instance = cls.__new__(cls)
+        instance.config_path = source
+        instance._validate_config(config)
+        instance.config = config
+        return instance
+
+    @classmethod
+    def create_multi_env_manager(cls, source_config: Optional[str] = None,
                                 target_config: Optional[str] = None):
         """Create a manager that supports multiple environment configurations.
         

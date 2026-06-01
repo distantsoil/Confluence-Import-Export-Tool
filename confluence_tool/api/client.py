@@ -4,8 +4,10 @@ import requests
 import logging
 import time
 from typing import Dict, List, Any, Optional, Union
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, urlsplit, urlunsplit, parse_qsl, urlencode
 import json
+
+from ..cancellation import check_cancelled, cancellable_sleep
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +76,8 @@ class ConfluenceAPIClient:
             
             if time_since_last < min_interval:
                 sleep_time = min_interval - time_since_last
-                time.sleep(sleep_time)
-        
+                cancellable_sleep(sleep_time)
+
         self._last_request_time = time.time()
     
     def _make_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
@@ -111,7 +113,7 @@ class ConfluenceAPIClient:
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
                     logger.warning(f"Rate limited. Waiting {retry_after} seconds...")
-                    time.sleep(retry_after)
+                    cancellable_sleep(retry_after)
                     continue
                 
                 # Check for authentication errors
@@ -159,8 +161,8 @@ class ConfluenceAPIClient:
             if attempt < self.max_retries:
                 wait_time = (2 ** attempt) * 1.0
                 logger.debug(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-        
+                cancellable_sleep(wait_time)
+
         raise requests.exceptions.RequestException("Max retries exceeded")
     
     def test_connection(self) -> bool:
@@ -351,64 +353,429 @@ class ConfluenceAPIClient:
         
         return data.get('results', [])
     
-    def download_attachment(self, download_url: str) -> bytes:
+    def preflight_attachment_download(self, space_key: str) -> Dict[str, Any]:
+        """Smoke-test that the current credentials can actually download a binary.
+
+        Walks a few pages of the space looking for an attachment, then tries to
+        fetch its bytes. Returns a dict with:
+          - status: 'ok' | 'no_attachments' | 'forbidden' | 'error'
+          - detail: human-readable explanation
+          - hint:   suggested user action when status != 'ok'
+
+        Intended to be called once at the start of an export so users with token
+        types that can list metadata but not download binaries (notably the new
+        scoped API tokens) get a clear, single error instead of hundreds of 401s.
+        """
+        try:
+            # Fetch only the first page (50 results) — keeps the pre-flight fast.
+            content_iter = self.get_space_content(space_key, 'page', limit=50, start=0)
+        except Exception as exc:
+            return {
+                'status': 'error',
+                'detail': f"Could not list pages in space {space_key!r}: {exc}",
+                'hint': "Verify the space key and that the account has read access.",
+            }
+
+        scanned = 0
+        for page in content_iter:
+            scanned += 1
+            try:
+                attachments = self.get_page_attachments(page['id'])
+            except Exception:
+                continue
+            if not attachments:
+                continue
+
+            att = attachments[0]
+            att_id = att.get('id')
+            download_url = att.get('_links', {}).get('download')
+            if not download_url:
+                continue
+
+            try:
+                self.download_attachment(download_url, attachment_id=att_id)
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, 'status_code', None)
+                detail_text = (
+                    self._summarise_http_error(e.response)
+                    if e.response is not None else str(e)
+                )
+                if status in (401, 403):
+                    return {
+                        'status': 'forbidden',
+                        'detail': (
+                            f"Attachment download returned {status} for "
+                            f"{att.get('title', '?')!r} (id={att_id}) on page "
+                            f"{page.get('title', '?')!r}. {detail_text}"
+                        ),
+                        'hint': (
+                            "Your token is rejected by the attachment-download "
+                            "endpoint. Most common cause: a SCOPED API token "
+                            "(created at id.atlassian.com via 'Create API token "
+                            "with scopes') — these cannot download binary "
+                            "attachments, only metadata. Regenerate as a CLASSIC "
+                            "API token (the 'Create API token' button without "
+                            "'with scopes') and try again.\n\n"
+                            "If you're already on a classic token, this is a "
+                            "known Atlassian limitation with the legacy attachment "
+                            "endpoint. Test the v1 REST endpoint directly to "
+                            "verify your token is otherwise healthy:\n\n"
+                            "    curl -u 'email@example.com:YOUR_TOKEN' -L \\\n"
+                            f"      '{self.base_url}/wiki/rest/api/content/"
+                            f"{page.get('id', 'PAGE_ID')}/child/attachment/"
+                            f"{att_id}/download' -o /tmp/test.bin\n\n"
+                            "If that curl works but the export still fails, send "
+                            "the verbose output back for analysis. If the curl "
+                            "also 401s, the issue is with the token itself, not "
+                            "this tool — try regenerating the token."
+                        ),
+                    }
+                return {
+                    'status': 'error',
+                    'detail': f"Attachment download failed with HTTP {status}: {detail_text}",
+                    'hint': "Re-run with --verbose for more context.",
+                }
+            except Exception as e:
+                return {
+                    'status': 'error',
+                    'detail': f"Attachment download raised {type(e).__name__}: {e}",
+                    'hint': "Re-run with --verbose for more context.",
+                }
+
+            return {
+                'status': 'ok',
+                'detail': (
+                    f"Verified: downloaded {att.get('title', '?')!r} "
+                    f"({len(attachments)} attachment(s) on page "
+                    f"{page.get('title', '?')!r})."
+                ),
+                'hint': '',
+            }
+
+        return {
+            'status': 'no_attachments',
+            'detail': (
+                f"Scanned {scanned} page(s) in {space_key!r} and found none "
+                "with attachments — download capability could not be verified."
+            ),
+            'hint': "This is informational only; the export will continue.",
+        }
+
+    @staticmethod
+    def _summarise_http_error(response: requests.Response) -> str:
+        """Extract the most useful diagnostic snippet from a Confluence error response.
+
+        Confluence returns either a JSON body with 'message'/'reason'/'code' or a
+        short HTML/text body. Truncate to keep log lines readable.
+        """
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            text = (response.text or '').strip().replace('\n', ' ')
+            return f"body[:200]={text[:200]!r}" if text else "(no body)"
+
+        # Common Confluence error fields
+        bits = []
+        for key in ('message', 'reason', 'code', 'errorMessages', 'errors',
+                    'title', 'detail', 'status-code'):
+            if key in payload and payload[key]:
+                bits.append(f"{key}={payload[key]!r}")
+        if not bits:
+            bits.append(f"json={str(payload)[:200]!r}")
+        return ", ".join(bits)
+
+    @staticmethod
+    def _summarise_response(response: requests.Response) -> str:
+        """Header + body snippet for failed-download diagnostics."""
+        if response is None:
+            return "(no response)"
+        # Headers that actually help diagnose auth issues
+        useful_headers = {}
+        for h in ('WWW-Authenticate', 'Content-Type', 'X-AREQUESTID',
+                  'X-ASEN', 'X-Confluence-Request-Time', 'Server'):
+            v = response.headers.get(h)
+            if v:
+                useful_headers[h] = v
+        try:
+            payload = response.json()
+            body_snippet = f"json={str(payload)[:300]!r}"
+        except (ValueError, json.JSONDecodeError):
+            text = (response.text or '').strip().replace('\n', ' ')
+            body_snippet = f"body[:300]={text[:300]!r}" if text else "(no body)"
+        return f"headers={useful_headers}, {body_snippet}"
+
+    @staticmethod
+    def _extract_page_id_from_download_url(download_url: str) -> Optional[str]:
+        """Pull the parent-page id out of a /download/attachments/<page_id>/<file> URL.
+
+        Matches the legacy browser-download path. Deliberately rejects v2-style
+        /wiki/api/v2/attachments/{id}/download URLs, where the numeric segment
+        is the *attachment* id, not a page id.
+        """
+        try:
+            path = urlsplit(download_url).path
+        except Exception:
+            return None
+        parts = [p for p in path.split('/') if p]
+        # Require the literal sequence ".../download/attachments/<digits>/..."
+        for i in range(len(parts) - 2):
+            if (parts[i] == 'download'
+                    and parts[i + 1] == 'attachments'
+                    and parts[i + 2].isdigit()):
+                return parts[i + 2]
+        return None
+
+    def download_attachment(self, download_url: str,
+                            attachment_id: Optional[str] = None) -> bytes:
         """Download attachment content.
-        
+
         Args:
             download_url: Download URL from attachment's _links.download field
-        
+            attachment_id: Optional attachment id (e.g. "att123" or "123") from
+                the v1 attachment metadata. When supplied on Cloud instances,
+                the v2 attachments endpoint is preferred — it authorizes
+                against the attachment object directly and avoids the legacy
+                media gateway that frequently 401s under token+Basic auth.
+
         Returns:
             Attachment content as bytes
-        
-        Notes:
-            The Confluence API returns download URLs in the _links.download field.
-            For Cloud instances, these URLs need /wiki prepended to work with API authentication.
-            
-            Example transformations:
-            - /download/attachments/123/file.png -> /wiki/download/attachments/123/file.png (Cloud)
-            - /download/attachments/123/file.png -> /download/attachments/123/file.png (Server/DC)
+        """
+        # Three Cloud endpoints to try, in the order most likely to honour a
+        # classic API token:
+        #
+        #   1. v1 REST: /wiki/rest/api/content/{page_id}/child/attachment/{id}/download
+        #      Routes through the same REST auth filter that already accepts
+        #      our token for the metadata listing — most likely to succeed
+        #      with a classic API token.
+        #
+        #   2. v2 REST: /wiki/api/v2/attachments/{numeric_id}/download
+        #      Modern endpoint, authorises against the attachment object.
+        #
+        #   3. Legacy:  /wiki/download/attachments/{page_id}/{file}?...
+        #      Browser-style download served by Confluence's legacy Tomcat
+        #      servlet. Often 401s with a Tomcat HTML page because its auth
+        #      filter doesn't recognise API tokens — keep as last resort.
+        #
+        # Each attempt logs at INFO so failures and successes are visible
+        # without --verbose; the response summary (status + headers + body
+        # snippet) is logged when an attempt is given up on.
+        last_exc: Optional[BaseException] = None
+
+        if attachment_id and self.is_cloud:
+            page_id = self._extract_page_id_from_download_url(download_url)
+
+            if page_id:
+                logger.info(
+                    f"Trying v1 REST download endpoint for attachment "
+                    f"{attachment_id} (page {page_id})"
+                )
+                try:
+                    return self._download_attachment_v1_rest(page_id, attachment_id)
+                except requests.exceptions.HTTPError as e:
+                    last_exc = e
+                    status = getattr(e.response, 'status_code', None)
+                    detail = (self._summarise_response(e.response)
+                              if e.response is not None else str(e))
+                    logger.info(
+                        f"v1 REST download returned {status} — falling through. {detail}"
+                    )
+                except requests.exceptions.RequestException as e:
+                    last_exc = e
+                    logger.info(f"v1 REST download errored ({e}) — falling through.")
+
+            logger.info(
+                f"Trying v2 download endpoint for attachment {attachment_id}"
+            )
+            try:
+                return self._download_attachment_v2(attachment_id)
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                status = getattr(e.response, 'status_code', None)
+                detail = (self._summarise_response(e.response)
+                          if e.response is not None else str(e))
+                logger.info(
+                    f"v2 download returned {status} — falling through. {detail}"
+                )
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                logger.info(f"v2 download errored ({e}) — falling through.")
+
+        logger.info(f"Trying legacy /wiki/download/attachments path: {download_url}")
+        return self._download_attachment_legacy(download_url)
+
+    @staticmethod
+    def _v2_attachment_id(attachment_id: str) -> str:
+        """v1 attachment ids look like 'att2345678'; v2 wants the numeric part."""
+        aid = str(attachment_id).strip()
+        if aid.lower().startswith('att'):
+            aid = aid[3:]
+        return aid
+
+    def _download_attachment_v1_rest(self, page_id: str, attachment_id: str) -> bytes:
+        """Download via v1 REST: /wiki/rest/api/content/{page_id}/child/attachment/{id}/download.
+
+        Atlassian community reports this works with classic API tokens where
+        the legacy /wiki/download/attachments/ and v2 endpoints fail, because
+        it shares the auth path with the metadata-listing endpoint we already
+        use successfully.
+        """
+        url = (
+            f"{self.base_url}/wiki/rest/api/content/{page_id}"
+            f"/child/attachment/{attachment_id}/download"
+        )
+        headers = {'Accept': '*/*'}
+        logger.debug(f"Downloading attachment via v1 REST: {url}")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                return response.content
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, 'status_code', None)
+                last_error = e
+                if status in (401, 403, 404):
+                    raise
+                logger.warning(
+                    f"v1 REST attachment download HTTP {status} on attempt "
+                    f"{attempt + 1}: {e}"
+                )
+                if attempt == self.max_retries:
+                    raise
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                logger.warning(f"v1 REST download timeout on attempt {attempt + 1}: {url}")
+                if attempt == self.max_retries:
+                    raise
+            if attempt < self.max_retries:
+                cancellable_sleep((2 ** attempt) * 1.0)
+
+        raise requests.exceptions.RequestException(
+            f"Max retries exceeded for v1 REST attachment download: {url}"
+        ) from last_error
+
+    def _download_attachment_v2(self, attachment_id: str) -> bytes:
+        """Download via Confluence Cloud's v2 attachments endpoint."""
+        v2_id = self._v2_attachment_id(attachment_id)
+        url = f"{self.base_url}/wiki/api/v2/attachments/{v2_id}/download"
+        headers = {'Accept': '*/*'}
+        logger.debug(f"Downloading attachment via v2 API: {url}")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                return response.content
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, 'status_code', None)
+                last_error = e
+                # 401/403/404 won't be fixed by retrying — bail out so the
+                # caller can fall back to the legacy URL.
+                if status in (401, 403, 404):
+                    if e.response is not None:
+                        logger.debug(
+                            f"v2 download {status} → {self._summarise_http_error(e.response)}"
+                        )
+                    raise
+                logger.warning(
+                    f"v2 attachment download HTTP error {status} on "
+                    f"attempt {attempt + 1}: {e}"
+                )
+                if attempt == self.max_retries:
+                    raise
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                logger.warning(f"v2 attachment download timeout on attempt {attempt + 1}: {url}")
+                if attempt == self.max_retries:
+                    raise
+            if attempt < self.max_retries:
+                cancellable_sleep((2 ** attempt) * 1.0)
+
+        raise requests.exceptions.RequestException(
+            f"Max retries exceeded for v2 attachment download: {url}"
+        ) from last_error
+
+    def _download_attachment_legacy(self, download_url: str) -> bytes:
+        """Download via the legacy /wiki/download/attachments/... path.
+
+        Used as a fallback when the v2 endpoint is unavailable (Server/DC,
+        missing id) or fails. Keeps the original behavior including the
+        'api=v2' query strip and binary-friendly Accept header.
         """
         # Check if download_url is a relative path
         if download_url.startswith('/'):
             # For Cloud instances, prepend /wiki to the download path
             if self.is_cloud and not download_url.startswith('/wiki/'):
                 download_url = f"/wiki{download_url}"
-            
+
             # Prepend base_url
             full_url = f"{self.base_url}{download_url}"
         else:
             # It's already a full URL
             full_url = download_url
-        
+
+        # Strip the 'api=v2' query parameter Confluence Cloud sticks on
+        # _links.download URLs.
+        parts = urlsplit(full_url)
+        if parts.query:
+            kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                    if k.lower() != 'api']
+            full_url = urlunsplit(parts._replace(query=urlencode(kept)))
+
+        headers = {'Accept': '*/*'}
+
         logger.debug(f"Downloading attachment from: {full_url}")
-        
+
         # Make the request with authentication and retry logic
         for attempt in range(self.max_retries + 1):
             try:
                 self._rate_limit()
-                
-                response = self.session.get(full_url, timeout=self.timeout, allow_redirects=True)
+
+                response = self.session.get(
+                    full_url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
                 response.raise_for_status()
-                
+
                 return response.content
-                
+
             except requests.exceptions.Timeout:
                 logger.warning(f"Attachment download timeout on attempt {attempt + 1}: {full_url}")
                 if attempt == self.max_retries:
                     raise
-                    
+
             except requests.exceptions.HTTPError as e:
-                logger.warning(f"Attachment download HTTP error {response.status_code} on attempt {attempt + 1}: {e}")
+                detail = self._summarise_http_error(response) if response is not None else "(no response)"
+                logger.warning(
+                    f"Attachment download HTTP error {response.status_code} on "
+                    f"attempt {attempt + 1}: {e} | {detail}"
+                )
                 logger.warning(f"  URL: {full_url}")
                 if attempt == self.max_retries:
                     raise
-            
+
             # Wait before retry (exponential backoff)
             if attempt < self.max_retries:
                 wait_time = (2 ** attempt) * 1.0
                 logger.debug(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-        
+                cancellable_sleep(wait_time)
+
         raise requests.exceptions.RequestException(f"Max retries exceeded for attachment download: {full_url}")
     
     def get_page_comments(self, page_id: str) -> List[Dict[str, Any]]:

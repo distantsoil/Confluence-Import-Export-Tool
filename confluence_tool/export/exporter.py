@@ -55,7 +55,28 @@ class ConfluenceExporter:
         """
         logger.info(f"Starting export of space: {space_key}")
         self.export_stats['start_time'] = datetime.now()
-        
+
+        # Pre-flight: verify the token can actually download a binary, not just
+        # list attachment metadata. Catches scoped API tokens (which cannot
+        # download attachments) and similar misconfigurations early — before
+        # the user sees hundreds of identical 401 warnings mid-export.
+        preflight = self.client.preflight_attachment_download(space_key)
+        status = preflight['status']
+        if status == 'ok':
+            logger.info(f"Pre-flight OK — {preflight['detail']}")
+        elif status == 'forbidden':
+            logger.error("Pre-flight FAILED — attachments cannot be downloaded with this token.")
+            logger.error(preflight['detail'])
+            logger.error(preflight['hint'])
+            raise PermissionError(
+                "Attachment download pre-flight failed: " + preflight['detail']
+                + "\n\n" + preflight['hint']
+            )
+        elif status == 'no_attachments':
+            logger.info(f"Pre-flight skipped — {preflight['detail']}")
+        else:  # 'error'
+            logger.warning(f"Pre-flight inconclusive — {preflight['detail']}")
+
         try:
             # Create export directory structure
             export_dir = self._create_export_directory(space_key)
@@ -279,27 +300,46 @@ class ConfluenceExporter:
         content_dir = os.path.join(export_dir, f"{content_type}s")
         os.makedirs(content_dir, exist_ok=True)
         
+        from ..cancellation import is_cancelled, CancelledError as _Cancelled
+
         # Export pages with progress bar
         with tqdm(total=len(pages), desc=f"Exporting {content_type}s") as pbar:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 # Submit all page export tasks
                 future_to_page = {
-                    executor.submit(self._export_single_page, page, content_dir): page 
+                    executor.submit(self._export_single_page, page, content_dir): page
                     for page in pages
                 }
-                
-                # Process completed tasks
+
+                # Process completed tasks. Check the cancellation flag between
+                # futures so a Ctrl-C is observed without waiting for the full
+                # batch to drain.
                 for future in concurrent.futures.as_completed(future_to_page):
+                    if is_cancelled():
+                        logger.warning("Cancellation requested — stopping page export.")
+                        raise _Cancelled("Cancelled by user (Ctrl-C)")
+
                     page = future_to_page[future]
                     try:
                         future.result()
                         self.export_stats['pages_exported'] += 1
+                    except _Cancelled:
+                        raise
                     except Exception as e:
                         error_msg = f"Failed to export {content_type} '{page.get('title', 'Unknown')}': {e}"
                         logger.error(error_msg)
                         self.export_stats['errors'].append(error_msg)
                     finally:
                         pbar.update(1)
+            finally:
+                # cancel_futures was added in Python 3.9. Fall back gracefully
+                # on older interpreters — workers will still observe the
+                # cancellation flag via cancellable_sleep() and exit quickly.
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
     
     def _export_single_page(self, page: Dict[str, Any], content_dir: str) -> None:
         """Export a single page with all its components.
@@ -474,9 +514,10 @@ class ConfluenceExporter:
         
         file_path = os.path.join(attach_dir, safe_filename)
         
-        # Download attachment content using the download URL from Confluence API
-        # The client will handle prepending /wiki for Cloud instances
-        content = self.client.download_attachment(download_url)
+        # Download attachment content. Passing the attachment id lets the
+        # client prefer the v2 endpoint on Cloud, which avoids the legacy
+        # media gateway's flaky 401 behavior.
+        content = self.client.download_attachment(download_url, attachment_id=attachment_id)
         
         # Write to file
         with open(file_path, 'wb') as f:
