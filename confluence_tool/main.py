@@ -24,6 +24,7 @@ from .export.exporter import ConfluenceExporter
 from .import_.importer import ConfluenceImporter
 from .sync.synchronizer import ConfluenceSynchronizer
 from . import profiles as profiles_mod
+from . import __version__ as PKG_VERSION
 from .utils.helpers import (
     setup_logging, display_spaces_table, prompt_space_selection,
     get_platform_info, validate_confluence_url, prompt_target_config_setup,
@@ -44,13 +45,22 @@ def print_colored(message: str, color: str = 'WHITE') -> None:
 
 
 def print_banner():
-    """Print application banner."""
-    banner = """
-╔══════════════════════════════════════════════════════════════╗
-║                Confluence Export-Import Tool                 ║
-║                         Version 1.0.0                       ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+    """Print application banner.
+
+    Version comes from confluence_tool/__init__.py so the displayed string is
+    always the version of the loaded package — useful for confirming that a
+    pip install -e . actually picked up new code.
+    """
+    version_line = f"Version {PKG_VERSION}"
+    # Inner box width = 62 chars between the side rails.
+    centred = version_line.center(62)
+    banner = (
+        "\n"
+        "╔══════════════════════════════════════════════════════════════╗\n"
+        "║                Confluence Export-Import Tool                 ║\n"
+        f"║{centred}║\n"
+        "╚══════════════════════════════════════════════════════════════╝\n"
+    )
     print_colored(banner, 'CYAN')
 
 
@@ -125,6 +135,8 @@ def init_config(ctx):
 @click.option('--profile', '-p', help='Use a saved profile from ~/.confluence-tool/profiles/')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.option('--reset', is_flag=True, help='Remove all tool state in ~/.confluence-tool/ and exit')
+@click.version_option(PKG_VERSION, '-V', '--version', prog_name='confluence-tool',
+                       message='%(prog)s %(version)s')
 @click.pass_context
 def cli(ctx, config, profile, verbose, reset):
     """Confluence Export-Import Tool - Export and import Confluence spaces via REST API.
