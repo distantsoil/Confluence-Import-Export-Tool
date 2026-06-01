@@ -351,22 +351,102 @@ class ConfluenceAPIClient:
         
         return data.get('results', [])
     
-    def download_attachment(self, download_url: str) -> bytes:
+    def download_attachment(self, download_url: str,
+                            attachment_id: Optional[str] = None) -> bytes:
         """Download attachment content.
-        
+
         Args:
             download_url: Download URL from attachment's _links.download field
-        
+            attachment_id: Optional attachment id (e.g. "att123" or "123") from
+                the v1 attachment metadata. When supplied on Cloud instances,
+                the v2 attachments endpoint is preferred — it authorizes
+                against the attachment object directly and avoids the legacy
+                media gateway that frequently 401s under token+Basic auth.
+
         Returns:
             Attachment content as bytes
-        
-        Notes:
-            The Confluence API returns download URLs in the _links.download field.
-            For Cloud instances, these URLs need /wiki prepended to work with API authentication.
-            
-            Example transformations:
-            - /download/attachments/123/file.png -> /wiki/download/attachments/123/file.png (Cloud)
-            - /download/attachments/123/file.png -> /download/attachments/123/file.png (Server/DC)
+        """
+        # Prefer the v2 endpoint on Cloud when we have an id. The legacy
+        # /wiki/download/attachments/<page_id>/<file> path is served by
+        # Confluence Cloud's media gateway, which enforces parent-page
+        # permissions in ways that can 401 even when the attachment is
+        # listed correctly by the REST API. The v2 endpoint authenticates
+        # against the attachment object itself.
+        if attachment_id and self.is_cloud:
+            try:
+                return self._download_attachment_v2(attachment_id)
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, 'status_code', None)
+                logger.debug(
+                    f"v2 download for attachment {attachment_id} returned "
+                    f"{status}; falling back to legacy URL"
+                )
+            except requests.exceptions.RequestException as e:
+                logger.debug(
+                    f"v2 download for attachment {attachment_id} failed "
+                    f"({e}); falling back to legacy URL"
+                )
+
+        return self._download_attachment_legacy(download_url)
+
+    @staticmethod
+    def _v2_attachment_id(attachment_id: str) -> str:
+        """v1 attachment ids look like 'att2345678'; v2 wants the numeric part."""
+        aid = str(attachment_id).strip()
+        if aid.lower().startswith('att'):
+            aid = aid[3:]
+        return aid
+
+    def _download_attachment_v2(self, attachment_id: str) -> bytes:
+        """Download via Confluence Cloud's v2 attachments endpoint."""
+        v2_id = self._v2_attachment_id(attachment_id)
+        url = f"{self.base_url}/wiki/api/v2/attachments/{v2_id}/download"
+        headers = {'Accept': '*/*'}
+        logger.debug(f"Downloading attachment via v2 API: {url}")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                self._rate_limit()
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                return response.content
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, 'status_code', None)
+                last_error = e
+                # 401/403/404 won't be fixed by retrying — bail out so the
+                # caller can fall back to the legacy URL.
+                if status in (401, 403, 404):
+                    raise
+                logger.warning(
+                    f"v2 attachment download HTTP error {status} on "
+                    f"attempt {attempt + 1}: {e}"
+                )
+                if attempt == self.max_retries:
+                    raise
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                logger.warning(f"v2 attachment download timeout on attempt {attempt + 1}: {url}")
+                if attempt == self.max_retries:
+                    raise
+            if attempt < self.max_retries:
+                time.sleep((2 ** attempt) * 1.0)
+
+        raise requests.exceptions.RequestException(
+            f"Max retries exceeded for v2 attachment download: {url}"
+        ) from last_error
+
+    def _download_attachment_legacy(self, download_url: str) -> bytes:
+        """Download via the legacy /wiki/download/attachments/... path.
+
+        Used as a fallback when the v2 endpoint is unavailable (Server/DC,
+        missing id) or fails. Keeps the original behavior including the
+        'api=v2' query strip and binary-friendly Accept header.
         """
         # Check if download_url is a relative path
         if download_url.startswith('/'):
@@ -381,19 +461,13 @@ class ConfluenceAPIClient:
             full_url = download_url
 
         # Strip the 'api=v2' query parameter Confluence Cloud sticks on
-        # _links.download URLs. That flag routes the request through a
-        # stricter media gateway that returns intermittent 401s on
-        # API-token + Basic auth flows. The legacy /wiki/download/attachments
-        # path itself still serves the file correctly.
+        # _links.download URLs.
         parts = urlsplit(full_url)
         if parts.query:
             kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
                     if k.lower() != 'api']
             full_url = urlunsplit(parts._replace(query=urlencode(kept)))
 
-        # Per-request headers: the session defaults to Accept: application/json
-        # for REST calls, but /wiki/download/attachments/ serves binary content
-        # and that gateway returns 401 (not 406) when Accept conflicts.
         headers = {'Accept': '*/*'}
 
         logger.debug(f"Downloading attachment from: {full_url}")
@@ -412,24 +486,24 @@ class ConfluenceAPIClient:
                 response.raise_for_status()
 
                 return response.content
-                
+
             except requests.exceptions.Timeout:
                 logger.warning(f"Attachment download timeout on attempt {attempt + 1}: {full_url}")
                 if attempt == self.max_retries:
                     raise
-                    
+
             except requests.exceptions.HTTPError as e:
                 logger.warning(f"Attachment download HTTP error {response.status_code} on attempt {attempt + 1}: {e}")
                 logger.warning(f"  URL: {full_url}")
                 if attempt == self.max_retries:
                     raise
-            
+
             # Wait before retry (exponential backoff)
             if attempt < self.max_retries:
                 wait_time = (2 ** attempt) * 1.0
                 logger.debug(f"Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
-        
+
         raise requests.exceptions.RequestException(f"Max retries exceeded for attachment download: {full_url}")
     
     def get_page_comments(self, page_id: str) -> List[Dict[str, Any]]:

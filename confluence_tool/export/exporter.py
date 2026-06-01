@@ -474,9 +474,10 @@ class ConfluenceExporter:
         
         file_path = os.path.join(attach_dir, safe_filename)
         
-        # Download attachment content using the download URL from Confluence API
-        # The client will handle prepending /wiki for Cloud instances
-        content = self.client.download_attachment(download_url)
+        # Download attachment content. Passing the attachment id lets the
+        # client prefer the v2 endpoint on Cloud, which avoids the legacy
+        # media gateway's flaky 401 behavior.
+        content = self.client.download_attachment(download_url, attachment_id=attachment_id)
         
         # Write to file
         with open(file_path, 'wb') as f:
